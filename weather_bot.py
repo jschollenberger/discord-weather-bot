@@ -18,8 +18,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 ---
 
-SNJ Mesh Weather Bot v2.7.1
-Changes from v2.7:
+SNJ Mesh Weather Bot v2.7.2
+Changes from v2.7.1:
+- FIX: _find_ref_in_posted() matched the first reference found in an update's
+  `references` list, not necessarily the immediate predecessor.  NWS often
+  lists the entire update chain (not just the last hop), so on a 2nd+ update
+  this could latch onto an older ancestor still in `posted`, misdirecting
+  reply-threading and leaving the true immediate predecessor to fall through
+  to the natural-expiry clear path instead.  Now matches by most recent `ts`
+  among all candidates, independent of list order.
+
+Changes from v2.7.1:
 - FIX: alert geography — UGC codes are now matched against explicit,
   verified NWS zone/county sets instead of a numeric 15-27 range.  The old
   range misread county codes (NJC021/023/025 = Mercer/Middlesex/Monmouth)
@@ -239,7 +248,7 @@ NOAA_TIDES_BASE     = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter
 AIRNOW_OBS_URL      = "https://www.airnowapi.org/aq/observation/latLong/current/"
 AIRNOW_FORECAST_URL = "https://www.airnowapi.org/aq/forecast/latLong/"
 NHC_STORMS_URL      = "https://www.nhc.noaa.gov/CurrentStorms.json"
-SNJ_UA              = "SNJMeshWeatherBot/2.7.1"
+SNJ_UA              = "SNJMeshWeatherBot/2.7.2"
 
 # ---------------------------------------------------------------------------
 # Timezone
@@ -1003,13 +1012,24 @@ async def _send_cleared(message_id, event: str, area: str, cancelled: bool = Fal
            f"cancelled={cancelled}, original_msg={message_id}")
 
 def _find_ref_in_posted(refs: list, posted: dict):
+    """
+    NWS often lists the *entire* update chain in `references`, not just the
+    immediate predecessor, and older links may still be present in `posted`.
+    Returning the first list match (pre-v2.7.2 behavior) could latch onto an
+    older ancestor instead of the immediate one, misdirecting reply-threading
+    and `superseded_by` bookkeeping.  Matching by latest `ts` instead always
+    picks the most recent still-tracked ancestor, regardless of the order
+    NWS lists references in.
+    """
+    candidates = []
     for ref in refs:
         for c in (ref.get("identifier",""), ref.get("@id","")):
             if not c: continue
-            if c in posted: return c
+            if c in posted: candidates.append(c)
             full = f"https://api.weather.gov/alerts/{c}"
-            if full in posted: return full
-    return None
+            if full in posted: candidates.append(full)
+    if not candidates: return None
+    return max(candidates, key=lambda c: posted[c].get("ts",0))
 
 # ---------------------------------------------------------------------------
 # NOAA Tides
@@ -1618,7 +1638,7 @@ async def on_ready():
     ch_name   = f"#{_channel.name}" if _channel else "unresolved"
     astral_ok = "enabled" if _ASTRAL_OK else "disabled (pip install astral)"
     print(f"\n{'─'*62}")
-    print(f"  SNJ Mesh Weather Bot v2.7.1|  {LOCATION_NAME}")
+    print(f"  SNJ Mesh Weather Bot v2.7.2|  {LOCATION_NAME}")
     print(f"  Station   : {PWS_STATION_ID}")
     print(f"  Channel   : {ch_name}")
     print(f"  Guild     : {DISCORD_GUILD_ID or 'global sync'}")
@@ -1882,7 +1902,7 @@ async def slash_status(interaction: discord.Interaction):
     embed = {"title":"📊  SNJ Mesh Weather Bot — Status",
              "color":0x57F287 if not cb_lines else 0xFFD700,
              "fields":fields,
-             "footer":{"text":f"v2.7.1 | Started {start_str}"}}
+             "footer":{"text":f"v2.7.2 | Started {start_str}"}}
     await interaction.followup.send(embed=discord.Embed.from_dict(embed), ephemeral=True)
 
 
@@ -1892,5 +1912,5 @@ async def slash_status(interaction: discord.Interaction):
 if __name__ == "__main__":
     if DISCORD_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         sys.exit("ERROR: discord_bot_token not set in config.json.")
-    log.info("SNJ Mesh Weather Bot v2.7.1 starting")
+    log.info("SNJ Mesh Weather Bot v2.7.2 starting")
     bot.run(DISCORD_BOT_TOKEN, log_handler=None)
