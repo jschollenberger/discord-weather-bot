@@ -1,7 +1,5 @@
 # SNJ Mesh Weather Bot
 
-*v2.7.1*
-
 A Discord bot that posts live weather conditions, NWS alerts, tides, air quality, and hurricane tracking for Southern New Jersey — Atlantic, Burlington, Camden, Cape May, Cumberland, Gloucester, and Salem counties.
 
 Conditions are pulled from a personal weather station (PWS) via the Aeris/Xweather API. Alerts, forecasts, tides, air quality, and tropical storm data come from NWS, NOAA CO-OPS, EPA AirNow, and the National Hurricane Center.
