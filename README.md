@@ -1,5 +1,9 @@
 # SNJ Mesh Weather Bot
 
+[![CI](https://github.com/jschollenberger/discord-weather-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/jschollenberger/discord-weather-bot/actions/workflows/ci.yml)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+
 A Discord bot that posts live weather conditions, NWS alerts, tides, air quality, and hurricane tracking for Southern New Jersey — Atlantic, Burlington, Camden, Cape May, Cumberland, Gloucester, and Salem counties.
 
 Conditions are pulled from a personal weather station (PWS) via the Aeris/Xweather API. Alerts, forecasts, tides, air quality, and tropical storm data come from NWS, NOAA CO-OPS, EPA AirNow, and the National Hurricane Center.
@@ -94,6 +98,18 @@ Suppressed or below-threshold alerts still show up in `/alerts` — they're just
 ## Running continuously
 
 This is a single long-running process with no built-in daemonization. Run it under `systemd`, `tmux`/`screen`, `pm2`, or your process supervisor of choice so it restarts if it ever exits. Logs go to `weather-bot.log`, with the previous run kept as `weather-bot.log.1`. `state.json` self-trims resolved alert entries older than 48 hours, so it won't grow without bound.
+
+## Development
+ 
+CI (GitHub Actions) runs lint, a compile check, and the test suite on Python 3.10–3.12 for every push and PR. To run the same checks locally:
+ 
+```bash
+pip install ruff pytest
+ruff check weather_bot.py tests/
+pytest
+```
+ 
+The tests in `tests/` are regression tests for logic that has actually failed in the past — the Southern-NJ geography filter, the zone→county fallback table, update-chain reference resolution, and state pruning. If you touch any of that, run them.
 
 ## Data sources
 

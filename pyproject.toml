@@ -1,0 +1,12 @@
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# F (pyflakes) catches real bugs: undefined names, unused imports, etc.
+# E9 catches syntax/indentation errors.  The codebase deliberately uses a
+# compact `if x: return y` style, so E701/E702 are not selected.
+select = ["F", "E9", "E722", "E731"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

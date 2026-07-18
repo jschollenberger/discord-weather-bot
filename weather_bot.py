@@ -754,7 +754,7 @@ def _sun_times() -> dict | None:
                               timezone="America/New_York",
                               latitude=FORECAST_LAT, longitude=FORECAST_LON)
         s   = _astral_sun(loc.observer, date=_now_et().date(), tzinfo=_TZ)
-        fmt = lambda dt: dt.strftime("%I:%M %p").lstrip("0")
+        def fmt(dt): return dt.strftime("%I:%M %p").lstrip("0")
         return {"sunrise": fmt(s["sunrise"]), "sunset": fmt(s["sunset"])}
     except Exception as e:
         log.warning(f"Sun times failed: {e}"); return None
@@ -1191,7 +1191,7 @@ def build_aqi_alert_embed(data: list, improving: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 def _knots_to_mph(k) -> int:
     try: return round(int(k)*1.15078)
-    except: return 0
+    except Exception: return 0
 
 def _storm_category(cl: str, mph: int) -> str:
     c = cl.upper()
@@ -1321,7 +1321,7 @@ def build_weekly_summary_embed(periods, aqi_data, tides, active_alerts: int) -> 
         tide_lines = []
         for date_str in sorted(by_date)[:7]:
             try: label = datetime.strptime(date_str,"%Y-%m-%d").strftime("%a %b %d")
-            except: label = date_str
+            except Exception: label = date_str
             highs = ", ".join(
                 datetime.strptime(h["t"],"%Y-%m-%d %H:%M").strftime("%I:%M %p").lstrip("0")
                 +f" ({float(h['v']):.1f} ft)" for h in by_date[date_str])
