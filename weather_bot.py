@@ -18,6 +18,21 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 ---
 
+SNJ Mesh Weather Bot v2.7.5
+Changes from v2.7.4:
+- NEW: --data-dir / --config command-line flags (env: SNJ_BOT_DIR,
+  SNJ_BOT_CONFIG) so a single checkout can run several instances, each with
+  its own config.json, state.json and log in a separate directory.
+- NEW: radar station is configurable (radar_station / radar_station_name /
+  radar_region) instead of being hardcoded to KDIX.
+- NEW: /radar attaches the live NWS RIDGE loop image instead of only linking
+  to it.  The image is fetched and uploaded rather than hotlinked, because
+  Discord's CDN caches embed image URLs and would serve a stale frame.
+  Falls back to link-only if the fetch fails.  Disable with
+  radar_attach_image: false.
+- /status now shows the configured coverage and radar station, and puts
+  location_name in the title, so multiple instances are distinguishable.
+
 SNJ Mesh Weather Bot v2.7.4
 Changes from v2.7.3:
 - SECURITY: credentials could be written to weather-bot.log in the clear.
@@ -117,9 +132,12 @@ Changes from v2.6:
 pip install discord.py aiohttp tzdata astral
 """
 
+import argparse
 import asyncio
+import io
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -143,8 +161,42 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-BASE_DIR    = Path(__file__).parent
-CONFIG_FILE = BASE_DIR / "config.json"
+# config.json, state.json and weather-bot.log all live in the data directory,
+# which defaults to the directory holding this script.  Overriding it lets one
+# checkout serve several instances (e.g. one guild per directory):
+#
+#   python weather_bot.py --data-dir ~/bots/atlantic
+#   SNJ_BOT_DIR=~/bots/atlantic python weather_bot.py
+#
+# Precedence: command line > environment > script directory.
+def _resolve_paths() -> tuple[Path, Path]:
+    ap = argparse.ArgumentParser(
+        prog="weather_bot.py",
+        description="SNJ Mesh Weather Bot — Discord weather bot for a "
+                    "configurable NWS coverage area.")
+    ap.add_argument("--data-dir", metavar="DIR",
+                    help="directory holding config.json, state.json and the "
+                         "log file (default: alongside this script; "
+                         "env: SNJ_BOT_DIR)")
+    ap.add_argument("--config", metavar="FILE",
+                    help="path to the config file "
+                         "(default: <data-dir>/config.json; "
+                         "env: SNJ_BOT_CONFIG)")
+    # parse_known_args so an unrecognised flag never hard-fails startup
+    args, _unknown = ap.parse_known_args()
+
+    data_dir = Path(args.data_dir or os.environ.get("SNJ_BOT_DIR")
+                    or Path(__file__).parent).expanduser()
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        sys.exit(f"ERROR: could not create data directory {data_dir}: {e}")
+
+    cfg_file = Path(args.config or os.environ.get("SNJ_BOT_CONFIG")
+                    or data_dir / "config.json").expanduser()
+    return cfg_file, data_dir
+
+CONFIG_FILE, BASE_DIR = _resolve_paths()
 STATE_FILE  = BASE_DIR / "state.json"
 LOG_FILE    = BASE_DIR / "weather-bot.log"
 
@@ -312,6 +364,13 @@ def _validate_config(cfg: dict) -> list[str]:
     elif not all(isinstance(x, str) for x in sup):
         errs.append("  x alert_suppress_types: every entry must be a string")
 
+    # Radar station IDs are 4-letter ICAO-style codes (KDIX, KDOX, ...).
+    # A malformed one would 404 on every /radar and silently drop the image.
+    rad = cfg.get("radar_station", "KDIX")
+    if not (isinstance(rad, str) and re.fullmatch(r"[A-Za-z]{4}", rad)):
+        errs.append(f"  x radar_station: must be a 4-letter NWS radar code "
+                    f"(e.g. KDIX), got {rad!r}")
+
     errs.extend(_validate_coverage(cfg.get("coverage")))
     return errs
 
@@ -410,6 +469,10 @@ FORECAST_LAT            = float(_cfg.get("forecast_lat",39.455))
 FORECAST_LON            = float(_cfg.get("forecast_lon",-74.722))
 TIDE_STATION_ID         = _cfg.get("tide_station_id","8534720")
 TIDE_STATION_NAME       = _cfg.get("tide_station_name","Atlantic City, NJ")
+RADAR_STATION           = str(_cfg.get("radar_station","KDIX")).upper()
+RADAR_STATION_NAME      = _cfg.get("radar_station_name","Fort Dix, NJ")
+RADAR_REGION            = _cfg.get("radar_region","northeast")
+RADAR_ATTACH_IMAGE      = bool(_cfg.get("radar_attach_image",True))
 AIRNOW_KEY              = _cfg.get("airnow_api_key")
 AQI_THRESHOLD           = int(_cfg.get("aqi_alert_threshold",3))
 WEEKLY_DAY              = int(_cfg.get("weekly_summary_day",6))
@@ -453,9 +516,13 @@ NWS_ALERTS_URL      = "https://api.weather.gov/alerts/active?area=NJ"
 NWS_POINTS_URL      = f"https://api.weather.gov/points/{FORECAST_LAT},{FORECAST_LON}"
 NOAA_TIDES_BASE     = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
 AIRNOW_OBS_URL      = "https://www.airnowapi.org/aq/observation/latLong/current/"
+# NWS RIDGE II "standard" products: <base>/<STATION>_loop.gif (animated) and
+# <STATION>_0.gif (latest single frame).  Station list: https://radar.weather.gov/
+RADAR_IMAGE_BASE    = "https://radar.weather.gov/ridge/standard"
+_RADAR_MAX_BYTES    = 8 * 1024 * 1024   # stay under Discord's attachment limit
 AIRNOW_FORECAST_URL = "https://www.airnowapi.org/aq/forecast/latLong/"
 NHC_STORMS_URL      = "https://www.nhc.noaa.gov/CurrentStorms.json"
-SNJ_UA              = "SNJMeshWeatherBot/2.7.4"
+SNJ_UA              = "SNJMeshWeatherBot/2.7.5"
 
 # ---------------------------------------------------------------------------
 # Timezone
@@ -1268,6 +1335,38 @@ def _find_ref_in_posted(refs: list, posted: dict):
 # ---------------------------------------------------------------------------
 # NOAA Tides
 # ---------------------------------------------------------------------------
+async def fetch_radar_image() -> bytes | None:
+    """
+    Fetch the current NWS RIDGE loop image for the configured station.
+
+    Returns None on any failure — the caller falls back to link buttons, so a
+    radar outage or an unexpected URL change degrades to the previous
+    behavior rather than breaking /radar.
+    """
+    url = f"{RADAR_IMAGE_BASE}/{RADAR_STATION}_loop.gif"
+    try:
+        sess = await _get_session()
+        to   = aiohttp.ClientTimeout(total=20)
+        async with sess.get(url, timeout=to) as r:
+            r.raise_for_status()
+            ctype = r.headers.get("Content-Type", "")
+            if "image" not in ctype:
+                log.warning(f"Radar image: unexpected Content-Type {ctype!r} "
+                            f"for {RADAR_STATION}")
+                return None
+            data = await r.read()
+    except Exception as e:
+        log.warning(f"Radar image fetch failed ({RADAR_STATION}): "
+                    f"{type(e).__name__}: {e}")
+        return None
+    # Discord rejects oversized attachments; bail out rather than fail the send
+    if len(data) > _RADAR_MAX_BYTES:
+        log.warning(f"Radar image too large ({len(data)//1024} KB) — "
+                    f"falling back to links")
+        return None
+    log.info(f"Radar image fetched: {RADAR_STATION} ({len(data)//1024} KB)")
+    return data
+
 async def fetch_tides(days: int = 2, station_id: str | None = None) -> list | None:
     sid    = station_id or TIDE_STATION_ID
     now_et = _now_et()
@@ -1907,7 +2006,7 @@ async def on_ready():
     ch_name   = f"#{_channel.name}" if _channel else "unresolved"
     astral_ok = "enabled" if _ASTRAL_OK else "disabled (pip install astral)"
     print(f"\n{'─'*62}")
-    print(f"  SNJ Mesh Weather Bot v2.7.4|  {LOCATION_NAME}")
+    print(f"  SNJ Mesh Weather Bot v2.7.5|  {LOCATION_NAME}")
     print(f"  Station   : {PWS_STATION_ID}")
     print(f"  Channel   : {ch_name}")
     print(f"  Guild     : {DISCORD_GUILD_ID or 'global sync'}")
@@ -2076,29 +2175,47 @@ async def slash_hurricane(interaction: discord.Interaction):
 
 
 
-@tree.command(name="radar", description=f"NWS radar for {LOCATION_NAME} — opens KDIX radar in your browser")
+@tree.command(name="radar",
+              description=f"NWS radar for {LOCATION_NAME} — live image and browser links")
 async def slash_radar(interaction: discord.Interaction):
     _log_cmd(interaction, "radar")
-    # KDIX (Fort Dix, NJ) is the primary WSR-88D covering Southern NJ.
-    # Additional views linked as buttons for convenience.
+    await interaction.response.defer()
+
     buttons = [
-        ("KDIX Standard",   "🌧️", "https://radar.weather.gov/station/KDIX/standard"),
-        ("KDIX Loop",       "🔄", "https://radar.weather.gov/station/KDIX/loop"),
-        ("Regional NE",     "🗺️", "https://radar.weather.gov/region/northeast/standard"),
+        (f"{RADAR_STATION} Standard", "🌧️",
+         f"https://radar.weather.gov/station/{RADAR_STATION}/standard"),
+        (f"{RADAR_STATION} Loop",     "🔄",
+         f"https://radar.weather.gov/station/{RADAR_STATION}/loop"),
+        ("Regional",                  "🗺️",
+         f"https://radar.weather.gov/region/{RADAR_REGION}/standard"),
     ]
     embed = {
         "title":       f"📡  NWS Radar — {LOCATION_NAME}",
-        "description": (
-            "**KDIX** (Fort Dix, NJ) is the primary radar covering Southern New Jersey.\n"
-            "Click a button below to open the live radar in your browser."
-        ),
+        "description": (f"**{RADAR_STATION}** ({RADAR_STATION_NAME}) is the "
+                        f"primary radar covering this area.\n"
+                        f"Use the buttons for the interactive viewer."),
         "color":       0x1E90FF,
-        "fields": [
-            {"name": "Coverage", "value": _coverage_label(), "inline": False},
-        ],
+        "fields": [{"name": "Coverage", "value": _coverage_label(), "inline": False}],
         "footer": {"text": "NWS radar.weather.gov | SNJ Mesh Weather"},
     }
-    await interaction.response.send_message(
+
+    # Attach the live image so the radar is visible without leaving Discord.
+    # Fetched and uploaded rather than hotlinked: Discord's CDN caches embed
+    # image URLs aggressively, which would serve a stale radar frame.
+    img = await fetch_radar_image() if RADAR_ATTACH_IMAGE else None
+    if img:
+        fname = f"radar_{RADAR_STATION}.gif"
+        embed["image"] = {"url": f"attachment://{fname}"}
+        await interaction.followup.send(
+            embed=discord.Embed.from_dict(embed),
+            file=discord.File(io.BytesIO(img), filename=fname),
+            view=LinkButtonView(buttons))
+        return
+
+    if RADAR_ATTACH_IMAGE:
+        embed["footer"] = {"text": "NWS radar.weather.gov | live image "
+                                   "unavailable — use the buttons below"}
+    await interaction.followup.send(
         embed=discord.Embed.from_dict(embed),
         view=LinkButtonView(buttons))
 
@@ -2160,6 +2277,10 @@ async def slash_status(interaction: discord.Interaction):
         {"name":"⏱️ Uptime",          "value":str(uptime),                                "inline":True},
         {"name":"📍 Channel",         "value":f"<#{ch_id}>",                              "inline":True},
         {"name":"📌 Conditions msg",  "value":cond_msg_val,                               "inline":True},
+        {"name":"🗺️ Coverage",        "value":f"{_coverage_label()} · "
+                                              f"{len(_COVERAGE_ZONES)} zone"
+                                              f"{'s' if len(_COVERAGE_ZONES)!=1 else ''} · "
+                                              f"{RADAR_STATION} radar",     "inline":False},
         {"name":"🌡️ Conditions",      "value":f"{_ago(last_cond)}\nNext ~{int(cond_next//60)}m","inline":True},
         {"name":"⚠️ Alert check",     "value":f"{_ago(last_alrt)}\nNext ~{int(alrt_next//60)}m","inline":True},
         {"name":"🚨 Active alerts",   "value":alert_val,                                  "inline":False},
@@ -2168,10 +2289,10 @@ async def slash_status(interaction: discord.Interaction):
         {"name":"🌐 HTTP (aiohttp)",  "value":"Native async",                             "inline":True},
         {"name":"📶 Circuit breakers","value":"\n".join(cb_lines) if cb_lines else "✅ All services nominal","inline":False},
     ]
-    embed = {"title":"📊  SNJ Mesh Weather Bot — Status",
+    embed = {"title":f"📊  SNJ Mesh Weather Bot — Status · {LOCATION_NAME}",
              "color":0x57F287 if not cb_lines else 0xFFD700,
              "fields":fields,
-             "footer":{"text":f"v2.7.4 | Started {start_str}"}}
+             "footer":{"text":f"v2.7.5 | Started {start_str}"}}
     await interaction.followup.send(embed=discord.Embed.from_dict(embed), ephemeral=True)
 
 
@@ -2181,7 +2302,7 @@ async def slash_status(interaction: discord.Interaction):
 if __name__ == "__main__":
     if DISCORD_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         sys.exit("ERROR: discord_bot_token not set in config.json.")
-    log.info("SNJ Mesh Weather Bot v2.7.4 starting")
+    log.info("SNJ Mesh Weather Bot v2.7.5 starting")
     try:
         bot.run(DISCORD_BOT_TOKEN, log_handler=None)
     except discord.LoginFailure:

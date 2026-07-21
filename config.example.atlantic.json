@@ -24,6 +24,11 @@
     "tide_station_id":          "8534720",
     "tide_station_name":        "Atlantic City, NJ",
 
+    "radar_station":            "KDIX",
+    "radar_station_name":       "Fort Dix, NJ",
+    "radar_region":             "northeast",
+    "radar_attach_image":       true,
+
     "airnow_api_key":           null,
     "aqi_alert_threshold":      3,
 

@@ -314,6 +314,19 @@ class TestValidateConfig:
         c = cfg(coverage={"Atlantic": {"county_code": "NJC001", "zones": ["NJZ22"]}})
         assert any("coverage" in e for e in _validate_config(c))
 
+    # --- radar station ---
+    @pytest.mark.parametrize("good", ["KDIX", "KDOX", "kdix"])
+    def test_valid_radar_station_accepted(self, good):
+        assert _validate_config(cfg(radar_station=good)) == []
+
+    @pytest.mark.parametrize("bad", ["KDI", "KDIXX", "K1IX", "", 42, None])
+    def test_bad_radar_station_is_error(self, bad):
+        errs = _validate_config(cfg(radar_station=bad))
+        assert any("radar_station" in e for e in errs)
+
+    def test_radar_station_defaults_when_absent(self):
+        assert _validate_config(cfg()) == []
+
 
 # ============================================================================
 # Config warnings - skippable settings must warn, never block

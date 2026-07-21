@@ -13,7 +13,7 @@ Conditions are pulled from a personal weather station (PWS) via the Aeris/Xweath
 - **Live conditions** that update in place on a single pinned message — temperature, feels-like, humidity/dewpoint, wind, barometric trend, rain, UV, and sunrise/sunset — with a manual Refresh button
 - **NWS alerts** posted automatically as they're issued, updated, or cancelled, filtered to Southern NJ by an explicit set of 10 NWS forecast zones and 7 county codes (see below) — not a heuristic — with a configurable severity threshold and a per-type suppression list
 - **Weekly outlook** auto-posted on a configurable day/time — forecast, tides, air quality, and active alert count
-- **Slash commands** for on-demand conditions, alerts, forecasts, tides, AQI, hurricane status, radar links, and bot health
+- **Slash commands** for on-demand conditions, alerts, forecasts, tides, AQI, hurricane status, live radar imagery, and bot health
 - **Built to stay up** — per-service circuit breakers and exponential-backoff retries mean one flaky upstream API degrades gracefully instead of taking the bot down, state is written atomically so a crash mid-write can't corrupt it, and an NWS outage is never mistaken for "no active alerts" (so it can't trigger false all-clears)
 
 ## Coverage area
@@ -48,12 +48,20 @@ Two ready-to-edit examples ship with the repo: `config.example.southern-nj.json`
 
 The bot serves one channel in one guild per process. To cover a second guild with a different area, run a **second instance of the same code** with its own config.
 
+Point each instance at its own data directory with `--data-dir` (or the `SNJ_BOT_DIR` environment variable). `config.json`, `state.json`, and the log file all live there, so one checkout serves any number of instances:
+
 ```bash
-git clone https://github.com/jschollenberger/discord-weather-bot.git bot-southern-nj
-git clone https://github.com/jschollenberger/discord-weather-bot.git bot-atlantic
+mkdir -p ~/bots/southern-nj ~/bots/atlantic
+cp config.example.southern-nj.json ~/bots/southern-nj/config.json
+cp config.example.atlantic.json    ~/bots/atlantic/config.json
+
+python weather_bot.py --data-dir ~/bots/southern-nj
+python weather_bot.py --data-dir ~/bots/atlantic
 ```
 
-Give each its own `config.json`. State, logs, and config are resolved next to `weather_bot.py`, so separate directories keep the two instances fully isolated with no code changes.
+`--config FILE` overrides just the config path if you'd rather keep it elsewhere. With no flags, everything resolves next to `weather_bot.py` as before, so existing single-instance setups need no changes.
+
+`/status` shows the coverage area, radar station, and `location_name` in its title, so it's obvious which instance you're talking to.
 
 Two things to get right:
 
@@ -70,7 +78,7 @@ Two things to get right:
 | `/tides [station_id]` | High/low tide schedule; optionally any NOAA CO-OPS station |
 | `/aqi` | Current + forecast EPA AirNow air quality (needs an API key) |
 | `/hurricane` | NHC Atlantic tropical storm / hurricane status |
-| `/radar` | Links to live NWS KDIX radar |
+| `/radar` | Live NWS radar image, plus links to the interactive viewer |
 | `/status` | Bot uptime, last update times, circuit-breaker health |
 | `/help` | Command list |
 
@@ -120,6 +128,9 @@ Startup validates `config.json` and exits with a specific, readable error for an
 | `alert_suppress_types` | [] | Specific event names to never auto-post, e.g. `"Small Craft Advisory"` |
 | `forecast_lat` / `forecast_lon` | 39.455 / -74.722 | Default forecast location |
 | `tide_station_id` / `tide_station_name` | 8534720 / "Atlantic City, NJ" | Default NOAA CO-OPS tide station |
+| `radar_station` / `radar_station_name` | KDIX / "Fort Dix, NJ" | NWS radar site used by `/radar` — [station list](https://radar.weather.gov/) |
+| `radar_region` | "northeast" | Regional radar view linked from `/radar` |
+| `radar_attach_image` | true | Attach the live radar loop image; set false to link only |
 | `airnow_api_key` | none | Optional — enables `/aqi` and AQI threshold alerts |
 | `aqi_alert_threshold` | 3 | AQI category (1–6) that triggers an alert |
 | `weekly_summary_day` / `weekly_summary_hour` | 6 / 8 | When the weekly outlook posts (0=Mon … 6=Sun, hour in ET) |
