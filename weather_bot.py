@@ -18,7 +18,52 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 ---
 
-SNJ Mesh Weather Bot v2.7.2
+SNJ Mesh Weather Bot v2.7.4
+Changes from v2.7.3:
+- SECURITY: credentials could be written to weather-bot.log in the clear.
+  aiohttp includes the full request URL in its exception text, and the
+  Aeris and AirNow endpoints carry credentials in the query string, so any
+  HTTP error from those services logged client_secret / API_KEY verbatim.
+  A logging filter now redacts all known secrets from every log record.
+- FIX: on_ready is re-dispatched by discord.py whenever a session cannot be
+  RESUMED, which started a SECOND scheduler — double-posting every
+  conditions update and every alert.  One-time setup now runs exactly once,
+  while channel resolution stays retryable so a reconnect can recover a
+  startup that failed to resolve the channel.
+- FIX: an unrecognised alert_post_threshold (e.g. "Warning", "warnings")
+  silently fell back to "all", quietly posting every advisory.  Now a
+  startup error.
+- FIX: alert_suppress_types given as a bare string became a set of single
+  CHARACTERS and silently matched nothing.  Now a startup error.
+- FIX: malformed or non-object config.json raised a raw JSONDecodeError
+  traceback; now reports the line and column of the syntax error.
+- FIX: an invalid bot token, missing intents, Discord outage, or network
+  failure at startup raised a raw traceback; each now exits with an
+  actionable message, with the full traceback written to the log.
+- NEW: config warnings for skippable settings (no channel id, no guild id,
+  no AirNow key, no coverage block) — reported at startup without blocking.
+- NEW: channel resolution retries with backoff instead of leaving the bot
+  permanently idle after one transient failure at startup.
+
+SNJ Mesh Weather Bot v2.7.3
+Changes from v2.7.2:
+- NEW: coverage area is now configurable via the "coverage" key in
+  config.json, so one codebase can serve multiple guilds with different
+  scopes (e.g. all of Southern NJ vs. Atlantic County only) without
+  forking.  Omitting the key keeps the previous 7-county behavior.
+- The zone list, county-code list, county-name list and zone->county table
+  are now all DERIVED from that single mapping, so they cannot drift apart.
+  (The hand-maintained zone->county table was wrong for 9 of 10 zones in
+  v2.7.)
+- Coverage config is validated at startup: malformed UGC codes, zone codes
+  used where county codes belong (and vice versa), and empty coverage are
+  reported as normal config errors instead of silently matching nothing.
+- Region-specific display strings now follow location_name / coverage
+  rather than being hardcoded to "Southern NJ" and the 7-county list.
+- Renamed for region-neutrality: _affects_southern_nj -> _in_coverage,
+  _snj_area_str -> _coverage_area_str, _is_snj_zone -> _is_coverage_zone,
+  _SNJ_* -> _COVERAGE_*, _NJZ_COUNTY_FALLBACK -> _ZONE_TO_COUNTY.
+
 Changes from v2.7.1:
 - FIX: _find_ref_in_posted() matched the first reference found in an update's
   `references` list, not necessarily the immediate predecessor.  NWS often
@@ -75,6 +120,7 @@ pip install discord.py aiohttp tzdata astral
 import asyncio
 import json
 import logging
+import re
 import sys
 import time
 from collections import defaultdict
@@ -130,14 +176,73 @@ logging.getLogger().addHandler(_fh)
 logging.getLogger().addHandler(_ch)
 log = logging.getLogger(__name__)
 
+class _RedactFilter(logging.Filter):
+    """
+    Strip credentials from every log record.
+
+    aiohttp puts the full request URL in its exception messages, and the
+    Aeris/Xweather and AirNow endpoints carry credentials in the query string,
+    so a plain `log.error(f"...: {e}")` on an HTTP failure would write
+    client_secret / API_KEY into weather-bot.log in the clear.  Filtering at
+    the handler level covers every call site, including discord.py's own
+    logger, rather than relying on each one to remember.
+    """
+    _secrets: list[str] = []
+
+    @classmethod
+    def set_secrets(cls, *values):
+        cls._secrets = sorted(
+            {str(v) for v in values if v and len(str(v)) >= 8},
+            key=len, reverse=True)   # longest first: avoid partial overlaps
+
+    def _scrub(self, text: str) -> str:
+        for s in self._secrets:
+            text = text.replace(s, "***REDACTED***")
+        return text
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._secrets:
+            if isinstance(record.msg, str):
+                record.msg = self._scrub(record.msg)
+            if record.args:
+                if isinstance(record.args, dict):
+                    record.args = {k: self._scrub(v) if isinstance(v, str) else v
+                                   for k, v in record.args.items()}
+                else:
+                    record.args = tuple(
+                        self._scrub(a) if isinstance(a, str) else a
+                        for a in record.args)
+        return True
+
+_redactor = _RedactFilter()
+_fh.addFilter(_redactor)
+_ch.addFilter(_redactor)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 def _load_config() -> dict:
     if not CONFIG_FILE.exists():
-        sys.exit(f"ERROR: {CONFIG_FILE} not found.")
-    with open(CONFIG_FILE, encoding="utf-8") as f:
-        return json.load(f)
+        sys.exit(f"ERROR: {CONFIG_FILE} not found.\n"
+                 f"       Copy one of the config.example.*.json files to "
+                 f"config.json and fill it in.")
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        sys.exit(f"ERROR: {CONFIG_FILE} is not valid JSON.\n"
+                 f"       {e.msg} at line {e.lineno}, column {e.colno}.\n"
+                 f"       (A trailing comma or missing quote is the usual cause.)")
+    except OSError as e:
+        sys.exit(f"ERROR: could not read {CONFIG_FILE}: {e}")
+    if not isinstance(cfg, dict):
+        sys.exit(f"ERROR: {CONFIG_FILE} must contain a JSON object, "
+                 f"got {type(cfg).__name__}.")
+    return cfg
+
+# Alert post threshold tiers.  Defined here (above _validate_config) so the
+# validator can check the configured value against the valid set.
+_THRESHOLD_TIER = {"warning": 1, "watch": 2, "all": 3}
 
 def _validate_config(cfg: dict) -> list[str]:
     errs: list[str] = []
@@ -180,13 +285,116 @@ def _validate_config(cfg: dict) -> list[str]:
     _int_check("aqi_alert_threshold",    3,   1,  6,     "{v} must be 1-6")
     _int_check("weekly_summary_day",     6,   0,  6,     "must be 0 (Mon) to 6 (Sun)")
     _int_check("weekly_summary_hour",    8,   0,  23,    "must be 0-23")
+    # location_name is interpolated into slash-command descriptions, which
+    # Discord caps at 100 chars.  The longest template leaves ~50 chars.
+    loc = cfg.get("location_name", "")
+    if len(str(loc)) > 40:
+        errs.append(f"  x location_name: keep under 40 characters "
+                    f"(got {len(str(loc))}) — it is used in slash-command "
+                    f"descriptions, which Discord caps at 100")
+
+    # An unrecognised threshold silently fell back to "all" pre-v2.7.4, so a
+    # typo like "Warning" or "warnings" would quietly post every advisory.
+    thr = cfg.get("alert_post_threshold", "all")
+    if thr not in _THRESHOLD_TIER:
+        errs.append(f"  x alert_post_threshold: must be one of "
+                    f"{', '.join(sorted(_THRESHOLD_TIER))} (got {thr!r})")
+
+    # set("Small Craft Advisory") is a set of single CHARACTERS, which silently
+    # matches nothing, so a bare string here must be rejected rather than used.
+    sup = cfg.get("alert_suppress_types", [])
+    if isinstance(sup, str):
+        errs.append(f"  x alert_suppress_types: must be a list of event names "
+                    f"— write [{sup!r}], not a bare string")
+    elif not isinstance(sup, list):
+        errs.append(f"  x alert_suppress_types: must be a list, "
+                    f"got {type(sup).__name__}")
+    elif not all(isinstance(x, str) for x in sup):
+        errs.append("  x alert_suppress_types: every entry must be a string")
+
+    errs.extend(_validate_coverage(cfg.get("coverage")))
+    return errs
+
+def _config_warnings(cfg: dict) -> list[str]:
+    """Non-fatal config observations: things that disable a feature or change
+    behavior in a way the operator probably wants to know about, but which are
+    perfectly valid.  Reported at startup; never block the bot from running."""
+    warns: list[str] = []
+    if not cfg.get("discord_channel_id"):
+        warns.append("  ! discord_channel_id not set — will fall back to the "
+                     "channel cached in state.json; on a fresh install the "
+                     "bot will have nowhere to post")
+    if not cfg.get("discord_guild_id"):
+        warns.append("  ! discord_guild_id not set — slash commands sync "
+                     "globally, which can take up to an hour to appear")
+    if not cfg.get("airnow_api_key"):
+        warns.append("  ! airnow_api_key not set — /aqi and AQI alerts disabled")
+    if not cfg.get("coverage"):
+        warns.append("  ! coverage not set — using the built-in 7-county "
+                     "Southern NJ default")
+    return warns
+
+# UGC codes are 2-letter state + Z (forecast zone) or C (county) + 3 digits,
+# e.g. NJZ022 / NJC001.  Validating the shape catches typos like "NJZ22" that
+# would otherwise silently match nothing and quietly narrow coverage.
+_UGC_RE = re.compile(r"^[A-Z]{2}[ZC]\d{3}$")
+
+def _validate_coverage(cov) -> list[str]:
+    """Validate the optional "coverage" config block.  Absent -> use the
+    Southern NJ default.  Never raises; returns friendly error strings."""
+    errs: list[str] = []
+    if cov is None:
+        return errs
+    if not isinstance(cov, dict) or not cov:
+        return ["  x coverage: must be a non-empty object of "
+                "{\"County Name\": {\"county_code\": ..., \"zones\": [...]}}"]
+    total_zones = 0
+    for name, entry in cov.items():
+        if not isinstance(entry, dict):
+            errs.append(f"  x coverage[{name!r}]: must be an object")
+            continue
+        code = entry.get("county_code")
+        if code is not None and not (isinstance(code, str) and _UGC_RE.match(code)):
+            errs.append(f"  x coverage[{name!r}].county_code: "
+                        f"not a valid UGC code, got {code!r}")
+        elif isinstance(code, str) and code[2] != "C":
+            errs.append(f"  x coverage[{name!r}].county_code: "
+                        f"{code} is a zone code (expected a C code, e.g. NJC001)")
+        zones = entry.get("zones", [])
+        if not isinstance(zones, list):
+            errs.append(f"  x coverage[{name!r}].zones: must be a list")
+            continue
+        total_zones += len(zones)
+        for z in zones:
+            if not (isinstance(z, str) and _UGC_RE.match(z)):
+                errs.append(f"  x coverage[{name!r}].zones: "
+                            f"not a valid UGC code, got {z!r}")
+            elif z[2] != "Z":
+                errs.append(f"  x coverage[{name!r}].zones: "
+                            f"{z} is a county code (expected a Z code, e.g. NJZ022)")
+    if not errs and not total_zones and not any(
+            e.get("county_code") for e in cov.values() if isinstance(e, dict)):
+        errs.append("  x coverage: no zones or county codes defined — "
+                    "no alerts would ever match")
     return errs
 
 _cfg = _load_config()
+
+# Register credentials with the log redactor before anything can log them.
+_RedactFilter.set_secrets(
+    _cfg.get("pws_client_id"), _cfg.get("pws_client_secret"),
+    _cfg.get("discord_bot_token"), _cfg.get("airnow_api_key"))
+
 _errs = _validate_config(_cfg)
 if _errs:
     print("\nconfig.json validation failed:\n" + "\n".join(_errs) + "\n")
     sys.exit(1)
+
+_warns = _config_warnings(_cfg)
+if _warns:
+    print("\nconfig.json warnings (not fatal):\n" + "\n".join(_warns) + "\n")
+    for _w in _warns:
+        log.warning(f"config: {_w.lstrip(' !')}")
 
 PWS_STATION_ID          = _cfg["pws_station_id"].upper()
 PWS_CLIENT_ID           = _cfg["pws_client_id"]
@@ -214,7 +422,6 @@ WEEKLY_HOUR             = int(_cfg.get("weekly_summary_hour",8))
 # Suppressed alerts still appear in /alerts and are tracked for deduplication.
 ALERT_POST_THRESHOLD = _cfg.get("alert_post_threshold", "all")
 ALERT_SUPPRESS_TYPES = set(_cfg.get("alert_suppress_types", []))
-_THRESHOLD_TIER      = {"warning": 1, "watch": 2, "all": 3}
 
 def _alert_tier(event: str) -> int:
     """
@@ -248,7 +455,7 @@ NOAA_TIDES_BASE     = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter
 AIRNOW_OBS_URL      = "https://www.airnowapi.org/aq/observation/latLong/current/"
 AIRNOW_FORECAST_URL = "https://www.airnowapi.org/aq/forecast/latLong/"
 NHC_STORMS_URL      = "https://www.nhc.noaa.gov/CurrentStorms.json"
-SNJ_UA              = "SNJMeshWeatherBot/2.7.2"
+SNJ_UA              = "SNJMeshWeatherBot/2.7.4"
 
 # ---------------------------------------------------------------------------
 # Timezone
@@ -537,7 +744,7 @@ class _AlertSelect(discord.ui.Select):
         for i, feature in enumerate(alerts[:25]):
             props   = feature.get("properties",{})
             event   = props.get("event","Alert")
-            area    = _snj_area_str(props.get("areaDesc",""))[:50]
+            area    = _coverage_area_str(props.get("areaDesc",""))[:50]
             exp     = (_fmt_time(props.get("expires"))[:16]
                        if props.get("expires") else "N/A")
             options.append(discord.SelectOption(
@@ -819,31 +1026,75 @@ _ALERT_EMOJIS = {
     "Extreme Wind Warning":"💨","Storm Surge Watch":"🌊","Storm Surge Warning":"🌊",
 }
 
-_SOUTHERN_NJ_COUNTIES = frozenset([
-    "Atlantic","Burlington","Camden","Cape May","Cumberland","Gloucester","Salem"])
-_SNJ_COUNTY_CODES = frozenset([
-    "NJC001","NJC005","NJC007","NJC009","NJC011","NJC015","NJC033"])
-
-# NWS public forecast zones (WFO Mount Holly) for the 7 Southern NJ counties.
-# NJZ016 Salem            NJZ022 Atlantic
-# NJZ017 Gloucester       NJZ023 Cape May
-# NJZ018 Camden           NJZ024 Atlantic Coastal Cape May
-# NJZ019 NW Burlington    NJZ025 Coastal Atlantic
-# NJZ021 Cumberland       NJZ027 SE Burlington
+# ---------------------------------------------------------------------------
+# Coverage area  (config-driven; see DEFAULT_COVERAGE / config.json "coverage")
+# ---------------------------------------------------------------------------
+# All three lookup sets below are DERIVED from the single COVERAGE mapping, so
+# the zone list, county-code list, county-name list, and the zone->county table
+# can never drift out of sync with each other.  (Pre-v2.7.3 the zone->county
+# table was maintained by hand separately, and was wrong for 9 of 10 zones.)
+#
+# NWS public forecast zones (WFO Mount Holly) for the 7 Southern NJ counties:
+#   NJZ016 Salem            NJZ022 Atlantic
+#   NJZ017 Gloucester       NJZ023 Cape May
+#   NJZ018 Camden           NJZ024 Atlantic Coastal Cape May  (Cape May Co.!)
+#   NJZ019 NW Burlington    NJZ025 Coastal Atlantic
+#   NJZ021 Cumberland       NJZ027 SE Burlington
 # Deliberately EXCLUDED: NJZ015 (Mercer), NJZ020 (Ocean), NJZ026 (Coastal Ocean).
-_SNJ_ZONE_CODES = frozenset([
-    "NJZ016","NJZ017","NJZ018","NJZ019","NJZ021",
-    "NJZ022","NJZ023","NJZ024","NJZ025","NJZ027"])
+#
+# NOTE: "Atlantic Coastal Cape May" (NJZ024) is a CAPE MAY county zone despite
+# the name.  Matching zones by name rather than code is how it gets mis-filed.
+DEFAULT_COVERAGE: dict[str, dict] = {
+    "Salem":      {"county_code": "NJC033", "zones": ["NJZ016"]},
+    "Gloucester": {"county_code": "NJC015", "zones": ["NJZ017"]},
+    "Camden":     {"county_code": "NJC007", "zones": ["NJZ018"]},
+    "Burlington": {"county_code": "NJC005", "zones": ["NJZ019", "NJZ027"]},
+    "Cumberland": {"county_code": "NJC011", "zones": ["NJZ021"]},
+    "Atlantic":   {"county_code": "NJC001", "zones": ["NJZ022", "NJZ025"]},
+    "Cape May":   {"county_code": "NJC009", "zones": ["NJZ023", "NJZ024"]},
+}
 
-def _is_snj_zone(code: str) -> bool:
-    return code in _SNJ_ZONE_CODES
+def _derive_coverage(cov: dict) -> tuple[frozenset, frozenset, frozenset, dict]:
+    """
+    Derive the four lookup structures from a coverage mapping:
+      (county names, county codes, zone codes, zone -> county code)
+    Kept as a function so tests can exercise any coverage config, and so the
+    four stay consistent by construction.
+    """
+    names        = frozenset(cov)
+    county_codes = frozenset(e["county_code"] for e in cov.values()
+                             if e.get("county_code"))
+    zones        = frozenset(z for e in cov.values() for z in e.get("zones", []))
+    # Zone -> county code.  Used to build NWS link URLs when the alert's UGC
+    # list carries zone codes but no county code (common for coastal/marine
+    # alert types).  A zone with no county mapping simply yields no NWS link
+    # button; nothing else breaks.
+    zone_to_county = {z: e["county_code"]
+                      for e in cov.values() if e.get("county_code")
+                      for z in e.get("zones", [])}
+    return names, county_codes, zones, zone_to_county
 
-def _affects_southern_nj(feature: dict) -> bool:
+COVERAGE: dict[str, dict] = _cfg.get("coverage") or DEFAULT_COVERAGE
+(_COVERAGE_NAMES, _COVERAGE_COUNTY_CODES,
+ _COVERAGE_ZONES, _ZONE_TO_COUNTY) = _derive_coverage(COVERAGE)
+
+def _coverage_label() -> str:
+    """Human-readable county list for embeds, derived from COVERAGE."""
+    names = sorted(_COVERAGE_NAMES)
+    if not names:
+        return LOCATION_NAME
+    noun = "County" if len(names) == 1 else "counties"
+    return f"{', '.join(names)} {noun}"
+
+def _is_coverage_zone(code: str) -> bool:
+    return code in _COVERAGE_ZONES
+
+def _in_coverage(feature: dict) -> bool:
     """
     UGC geocodes are authoritative when present: in scope only if the alert
-    lists a Southern NJ forecast zone (NJZ) or county code (NJC).  County-name
-    matching against areaDesc/headline is a fallback for the rare alert that
-    carries no UGC list.
+    lists a configured forecast zone or county code.  County-name matching
+    against areaDesc/headline is a fallback for the rare alert that carries
+    no UGC list.
     (Pre-v2.7.1 this accepted ANY NJZ/NJC code numbered 15-27.  That range is
     wrong for county codes — NJC021/023/025 are Mercer/Middlesex/Monmouth —
     and also swept in zones NJZ015/020/026 (Mercer, Ocean, Coastal Ocean),
@@ -852,31 +1103,14 @@ def _affects_southern_nj(feature: dict) -> bool:
     props = feature.get("properties",{})
     ugc   = props.get("geocode",{}).get("UGC",[])
     if ugc:
-        return any(c in _SNJ_ZONE_CODES or c in _SNJ_COUNTY_CODES for c in ugc)
+        return any(c in _COVERAGE_ZONES or c in _COVERAGE_COUNTY_CODES for c in ugc)
     combined = props.get("areaDesc","") + " " + props.get("headline","")
-    return any(c in combined for c in _SOUTHERN_NJ_COUNTIES)
+    return any(c in combined for c in _COVERAGE_NAMES)
 
-def _snj_area_str(area_desc: str) -> str:
+def _coverage_area_str(area_desc: str) -> str:
     parts = [p.strip() for p in area_desc.split(";")
-             if any(c in p for c in _SOUTHERN_NJ_COUNTIES)]
+             if any(c in p for c in _COVERAGE_NAMES)]
     return "; ".join(parts) if parts else area_desc[:300]
-
-# Static zone-to-county fallback for Southern NJ.
-# Used when the alert's UGC list contains NJZ codes but not the corresponding
-# NJC county code (common for coastal/marine alert types).
-# Mapping per NWS Mount Holly zone definitions (see _SNJ_ZONE_CODES above).
-_NJZ_COUNTY_FALLBACK: dict[str, str] = {
-    "NJZ016": "NJC033",  # Salem County
-    "NJZ017": "NJC015",  # Gloucester County
-    "NJZ018": "NJC007",  # Camden County
-    "NJZ019": "NJC005",  # Northwestern Burlington County
-    "NJZ021": "NJC011",  # Cumberland County
-    "NJZ022": "NJC001",  # Atlantic County
-    "NJZ023": "NJC009",  # Cape May County
-    "NJZ024": "NJC009",  # Atlantic Coastal Cape May -> Cape May County
-    "NJZ025": "NJC001",  # Coastal Atlantic -> Atlantic County
-    "NJZ027": "NJC005",  # Southeastern Burlington County
-}
 
 def _nws_human_url(feature: dict) -> str:
     """
@@ -885,12 +1119,12 @@ def _nws_human_url(feature: dict) -> str:
     list first, then from the static fallback table if not present.
     """
     ugc  = feature.get("properties",{}).get("geocode",{}).get("UGC",[])
-    zone = next((c for c in ugc if c.startswith("NJZ") and _is_snj_zone(c)), "")
+    zone = next((c for c in ugc if _is_coverage_zone(c)), "")
     if not zone:
         return ""
     # Prefer explicit county code from UGC; fall back to static table
-    county = (next((c for c in ugc if c in _SNJ_COUNTY_CODES), "")
-              or _NJZ_COUNTY_FALLBACK.get(zone, ""))
+    county = (next((c for c in ugc if c in _COVERAGE_COUNTY_CODES), "")
+              or _ZONE_TO_COUNTY.get(zone, ""))
     if not county:
         # No county resolved — URL would be incomplete; skip NWS link entirely
         return ""
@@ -937,7 +1171,7 @@ async def fetch_alerts(fast: bool = False) -> list | None:
 def build_alert_embed(feature: dict) -> dict:
     props = feature.get("properties",{})
     event = props.get("event","Weather Alert")
-    area  = _snj_area_str(props.get("areaDesc","")) or props.get("areaDesc","")[:300]
+    area  = _coverage_area_str(props.get("areaDesc","")) or props.get("areaDesc","")[:300]
     exp   = _fmt_time(props.get("expires")) if props.get("expires") else "N/A"
     return {
         "title":       f"{_ALERT_EMOJIS.get(event,'⚠️')}  {event}",
@@ -951,7 +1185,7 @@ def build_alert_embed(feature: dict) -> dict:
 def build_update_embed(feature: dict) -> dict:
     props = feature.get("properties",{})
     event = props.get("event","Weather Alert")
-    area  = _snj_area_str(props.get("areaDesc","")) or props.get("areaDesc","")[:300]
+    area  = _coverage_area_str(props.get("areaDesc","")) or props.get("areaDesc","")[:300]
     exp   = _fmt_time(props.get("expires")) if props.get("expires") else "N/A"
     return {
         "title":       f"🔄  UPDATED — {_ALERT_EMOJIS.get(event,'⚠️')} {event}",
@@ -974,7 +1208,7 @@ def build_alerts_summary_embed(alerts: list,
         props   = f.get("properties",{})
         event   = props.get("event","Alert")
         tier    = _alert_tier(event)
-        area    = _snj_area_str(props.get("areaDesc",""))[:80]
+        area    = _coverage_area_str(props.get("areaDesc",""))[:80]
         expires = _fmt_time(props.get("expires")) if props.get("expires") else "N/A"
         upd_tag = " *(Updated)*" if props.get("messageType","Alert")=="Update" else ""
         sup_tag = " *(not auto-posted — below threshold)*" \
@@ -983,7 +1217,7 @@ def build_alerts_summary_embed(alerts: list,
         lines.append(f"{tier_dot} {_ALERT_EMOJIS.get(event,'⚠️')} **{event}**{upd_tag}{sup_tag}\n"
                      f"↳ {area} · Exp. {expires}")
     return {
-        "title":       f"⚠️  {len(alerts)} Active Alert{'s' if len(alerts)!=1 else ''} — Southern NJ",
+        "title":       f"⚠️  {len(alerts)} Active Alert{'s' if len(alerts)!=1 else ''} — {LOCATION_NAME}",
         "description": "\n\n".join(lines),
         "color":       0xFF6600,
         "footer":      {"text":"Use the dropdown below for full details on each alert"},
@@ -1142,7 +1376,7 @@ async def fetch_aqi_forecast() -> list | None:
 def build_aqi_embed(obs: list, forecast: list | None = None) -> dict:
     overall  = max(obs, key=lambda x: x.get("AQI",0)) if obs else {}
     best_num = overall.get("Category",{}).get("Number",1)
-    area     = overall.get("ReportingArea","Southern NJ")
+    area     = overall.get("ReportingArea",LOCATION_NAME)
     obs_fields = [{"name":f"{_aqi_dot(i.get('Category',{}).get('Number',1))} {i.get('ParameterName','?')}",
                    "value":f"AQI **{i.get('AQI','—')}** — {i.get('Category',{}).get('Name','?')}",
                    "inline":True} for i in obs]
@@ -1173,7 +1407,7 @@ def build_aqi_embed(obs: list, forecast: list | None = None) -> dict:
 def build_aqi_alert_embed(data: list, improving: bool = False) -> dict:
     overall = max(data,key=lambda x:x.get("AQI",0))
     num     = overall.get("Category",{}).get("Number",1)
-    area    = overall.get("ReportingArea","Southern NJ")
+    area    = overall.get("ReportingArea",LOCATION_NAME)
     if improving:
         return {"title":"🟢  Air Quality Improved",
                 "description":f"AQI returned to **{_AQI_LABEL.get(num,'acceptable')}** "
@@ -1336,7 +1570,7 @@ def build_weekly_summary_embed(periods, aqi_data, tides, active_alerts: int) -> 
                        "value":f"{_aqi_dot(cat.get('Number',1))} {cat.get('Name','?')} (AQI {best.get('AQI','—')})",
                        "inline":True})
     fields.append({"name":"⚠️ Active NWS Alerts",
-                   "value":f"{active_alerts} alert{'s' if active_alerts!=1 else ''} for Southern NJ",
+                   "value":f"{active_alerts} alert{'s' if active_alerts!=1 else ''} for {LOCATION_NAME}",
                    "inline":True})
     return {"title":f"📊  Weekly Outlook — {LOCATION_NAME}",
             "description":f"*{now_et.strftime('%b %d')} – {(now_et+timedelta(days=6)).strftime('%b %d, %Y')}*",
@@ -1414,9 +1648,9 @@ async def _task_alerts() -> bool:
     if all_alerts is None:
         log.warning("Alert fetch failed — skipping this cycle (no clears/prunes)")
         return False
-    southern   = [f for f in all_alerts if _affects_southern_nj(f)]
+    southern   = [f for f in all_alerts if _in_coverage(f)]
     active_ids = {f.get("id","") for f in southern}
-    log.info(f"  {len(all_alerts)} NJ total -> {len(southern)} Southern NJ active")
+    log.info(f"  {len(all_alerts)} state total -> {len(southern)} in coverage active")
 
     posted  = _state.setdefault("posted_alerts",{})
     any_new = False
@@ -1427,7 +1661,7 @@ async def _task_alerts() -> bool:
         if not aid or aid in posted: continue
         msg_type = props.get("messageType","Alert")
         refs     = props.get("references",[])
-        area     = _snj_area_str(props.get("areaDesc","")) or props.get("areaDesc","")[:200]
+        area     = _coverage_area_str(props.get("areaDesc","")) or props.get("areaDesc","")[:200]
         view     = _alert_view(feature)
         event    = props.get("event","Weather Alert")
         expires  = _fmt_time(props.get("expires")) if props.get("expires") else "N/A"
@@ -1439,7 +1673,7 @@ async def _task_alerts() -> bool:
                 if not posted[old_aid].get("suppressed"):  # no clear notif for suppressed
                     await _send_cleared(posted[old_aid].get("message_id"),
                                         posted[old_aid].get("event","Weather Alert"),
-                                        posted[old_aid].get("area","Southern NJ"),cancelled=True)
+                                        posted[old_aid].get("area",LOCATION_NAME),cancelled=True)
                 posted[old_aid]["cleared"] = True; posted[old_aid]["cleared_ts"] = time.time()
             posted[aid] = {"ts":time.time(),"cleared":True,"event":"_cancel"}
             save_state(_state)
@@ -1491,7 +1725,7 @@ async def _task_alerts() -> bool:
         if (not info.get("cleared") and not info.get("suppressed")
                 and not info.get("superseded_by") and aid not in active_ids):
             await _send_cleared(info.get("message_id"),info.get("event","Weather Alert"),
-                                info.get("area","Southern NJ"))
+                                info.get("area",LOCATION_NAME))
             posted[aid]["cleared"] = True; posted[aid]["cleared_ts"] = time.time()
             cleared_any = True
 
@@ -1518,7 +1752,7 @@ async def _post_weekly_summary():
     aqi_data   = await fetch_aqi() if AIRNOW_KEY else None
     tides      = await fetch_tides(7)
     all_alerts = await fetch_alerts() or []
-    active_snj = sum(1 for f in all_alerts if _affects_southern_nj(f))
+    active_snj = sum(1 for f in all_alerts if _in_coverage(f))
     await _send(build_weekly_summary_embed(periods,aqi_data,tides,active_snj))
     _event("📊  Weekly summary posted")
 
@@ -1593,13 +1827,13 @@ _HELP_EMBED = {
     "color": 0x1E90FF,
     "fields": [
         {"name":"/conditions","value":"Latest PWS reading. Optional: `station_id` for any Xweather station.","inline":False},
-        {"name":"/alerts",    "value":"Active NWS alerts for Southern NJ.","inline":False},
+        {"name":"/alerts",    "value":f"Active NWS alerts for {LOCATION_NAME}.","inline":False},
         {"name":"/forecast",  "value":"NWS 7-day forecast. Optional: `zipcode` for any US zip.","inline":False},
         {"name":"/tides",     "value":f"High/low tides — {TIDE_STATION_NAME}. Optional: `station_id` for any NOAA CO-OPS station.","inline":False},
         {"name":"/aqi",       "value":"EPA AirNow air quality report." +
                                ("" if AIRNOW_KEY else " *(API key not configured)*"),"inline":False},
         {"name":"/hurricane", "value":"NHC Atlantic tropical storm status.","inline":False},
-        {"name":"/radar",     "value":"Live NWS KDIX radar for Southern NJ (opens in browser).","inline":False},
+        {"name":"/radar",     "value":f"Live NWS KDIX radar for {LOCATION_NAME} (opens in browser).","inline":False},
         {"name":"/status",    "value":"Bot operational status, last update times, circuit-breaker health.","inline":False},
         {"name":"/help",      "value":"Show this message.","inline":False},
     ],
@@ -1607,24 +1841,58 @@ _HELP_EMBED = {
 }
 
 
+_ready_once = False
+_scheduler_started = False
+
+async def _resolve_channel_with_retry(attempts: int = 4) -> None:
+    """
+    Resolve the posting channel, retrying a few times with backoff.
+    A single transient API hiccup at startup previously left _channel None
+    for the life of the process, silently disabling the bot until someone
+    noticed and restarted it.
+    """
+    for i in range(attempts):
+        await _resolve_channel()
+        if _channel is not None:
+            if i:
+                log.info(f"Channel resolved on attempt {i+1}")
+            return
+        if i < attempts - 1:
+            delay = 5 * (2 ** i)
+            log.warning(f"Channel unresolved — retry {i+1}/{attempts-1} in {delay}s")
+            await asyncio.sleep(delay)
+
 @bot.event
 async def on_ready():
-    global _state, _start_time
-    _state      = load_state()
-    _start_time = time.time()
+    global _state, _start_time, _ready_once, _scheduler_started
 
-    await _resolve_channel()
+    # discord.py re-dispatches READY whenever a session cannot be RESUMED, so
+    # on_ready may run several times in one process.  One-time setup (state
+    # load, persistent view, command sync) must not repeat — re-running it
+    # previously spawned a SECOND scheduler, double-posting every conditions
+    # update and every alert.  Channel resolution is deliberately left
+    # retryable so a reconnect can recover a startup that failed to resolve.
+    if _scheduler_started:
+        log.info("Reconnected (READY re-dispatched); scheduler already running")
+        return
+
+    if not _ready_once:
+        _ready_once = True
+        _state      = load_state()
+        _start_time = time.time()
+        bot.add_view(ConditionsRefreshView())
+        await tree.sync()
+        log.info("Slash commands synced globally (DM access enabled)")
+        if DISCORD_GUILD_ID:
+            guild = discord.Object(id=int(DISCORD_GUILD_ID))
+            tree.copy_global_to(guild=guild)
+            await tree.sync(guild=guild)
+            log.info(f"Slash commands synced to guild {DISCORD_GUILD_ID} (instant)")
+    else:
+        log.info("READY re-dispatched; retrying channel resolution")
+
+    await _resolve_channel_with_retry()
     save_state(_state)
-
-    bot.add_view(ConditionsRefreshView())
-
-    await tree.sync()
-    log.info("Slash commands synced globally (DM access enabled)")
-    if DISCORD_GUILD_ID:
-        guild = discord.Object(id=int(DISCORD_GUILD_ID))
-        tree.copy_global_to(guild=guild)
-        await tree.sync(guild=guild)
-        log.info(f"Slash commands synced to guild {DISCORD_GUILD_ID} (instant)")
 
     log.info(f"Bot online: {bot.user} (ID: {bot.user.id})")
     if _channel is None:
@@ -1633,12 +1901,13 @@ async def on_ready():
               "   Set discord_channel_id in config.json and restart.\n")
         log.error("Channel unresolved; scheduler not started")
     else:
+        _scheduler_started = True
         asyncio.create_task(_scheduler())
 
     ch_name   = f"#{_channel.name}" if _channel else "unresolved"
     astral_ok = "enabled" if _ASTRAL_OK else "disabled (pip install astral)"
     print(f"\n{'─'*62}")
-    print(f"  SNJ Mesh Weather Bot v2.7.2|  {LOCATION_NAME}")
+    print(f"  SNJ Mesh Weather Bot v2.7.4|  {LOCATION_NAME}")
     print(f"  Station   : {PWS_STATION_ID}")
     print(f"  Channel   : {ch_name}")
     print(f"  Guild     : {DISCORD_GUILD_ID or 'global sync'}")
@@ -1646,6 +1915,8 @@ async def on_ready():
           f"repost every {CONDITIONS_REPOST_HOURS} h"
           +(" (pinned + 🔄 button)" if PIN_CONDITIONS else " (🔄 button)"))
     print(f"  Alerts    : poll every {ALERT_INTERVAL_SECS//60} min")
+    print(f"  Coverage  : {_coverage_label()} "
+          f"({len(_COVERAGE_ZONES)} zone{'s' if len(_COVERAGE_ZONES)!=1 else ''})")
     print(f"  Tides     : NOAA {TIDE_STATION_ID} ({TIDE_STATION_NAME})")
     print(f"  AQI       : {'AirNow enabled (threshold cat >= '+str(AQI_THRESHOLD)+')' if AIRNOW_KEY else 'AirNow disabled (no API key)'}")
     print(f"  Sunrise   : {astral_ok}")
@@ -1676,7 +1947,7 @@ async def slash_conditions(interaction: discord.Interaction,
             f"❌  Could not reach the weather station{hint} — check the ID and try again.")
 
 
-@tree.command(name="alerts", description="Check active NWS alerts for all 7 Southern NJ counties")
+@tree.command(name="alerts", description=f"Check active NWS alerts for {LOCATION_NAME}")
 async def slash_alerts(interaction: discord.Interaction):
     _log_cmd(interaction, "alerts")
     await interaction.response.defer()
@@ -1685,9 +1956,9 @@ async def slash_alerts(interaction: discord.Interaction):
         await interaction.followup.send(
             "❌  Could not reach the NWS alerts API — try again in a moment.")
         return
-    southern   = [f for f in all_alerts if _affects_southern_nj(f)]
+    southern   = [f for f in all_alerts if _in_coverage(f)]
     if not southern:
-        await interaction.followup.send("✅  No active NWS alerts for Southern NJ right now.")
+        await interaction.followup.send(f"✅  No active NWS alerts for {LOCATION_NAME} right now.")
         return
     # Identify which active alerts are below the current post threshold
     suppressed = {f.get("properties",{}).get("event","") for f in southern
@@ -1718,7 +1989,7 @@ async def slash_alerts(interaction: discord.Interaction):
 
 
 @tree.command(name="forecast",
-              description="NWS 7-day forecast — defaults to Southern NJ, or enter a US zip code")
+              description=f"NWS 7-day forecast — defaults to {LOCATION_NAME}, or enter a US zip code")
 @app_commands.describe(zipcode="Optional US zip code (e.g. 08330)")
 async def slash_forecast(interaction: discord.Interaction,
                          zipcode: str | None = None):
@@ -1805,7 +2076,7 @@ async def slash_hurricane(interaction: discord.Interaction):
 
 
 
-@tree.command(name="radar", description="NWS radar for Southern NJ — opens KDIX radar in your browser")
+@tree.command(name="radar", description=f"NWS radar for {LOCATION_NAME} — opens KDIX radar in your browser")
 async def slash_radar(interaction: discord.Interaction):
     _log_cmd(interaction, "radar")
     # KDIX (Fort Dix, NJ) is the primary WSR-88D covering Southern NJ.
@@ -1816,16 +2087,14 @@ async def slash_radar(interaction: discord.Interaction):
         ("Regional NE",     "🗺️", "https://radar.weather.gov/region/northeast/standard"),
     ]
     embed = {
-        "title":       "📡  NWS Radar — Southern NJ",
+        "title":       f"📡  NWS Radar — {LOCATION_NAME}",
         "description": (
             "**KDIX** (Fort Dix, NJ) is the primary radar covering Southern New Jersey.\n"
             "Click a button below to open the live radar in your browser."
         ),
         "color":       0x1E90FF,
         "fields": [
-            {"name": "Coverage", "value": "Atlantic, Burlington, Camden, Cape May, "
-                                          "Cumberland, Gloucester, Salem counties",
-             "inline": False},
+            {"name": "Coverage", "value": _coverage_label(), "inline": False},
         ],
         "footer": {"text": "NWS radar.weather.gov | SNJ Mesh Weather"},
     }
@@ -1880,7 +2149,7 @@ async def slash_status(interaction: discord.Interaction):
     if active_alt:
         alert_lines = [
             f"{_ALERT_EMOJIS.get(i.get('event',''),'⚠️')} **{i.get('event','Alert')}**\n"
-            f"  ↳ {i.get('area','Southern NJ')[:60]}"
+            f"  ↳ {i.get('area',LOCATION_NAME)[:60]}"
             for i in active_alt
         ]
         alert_val = "\n".join(alert_lines)[:1024]
@@ -1902,7 +2171,7 @@ async def slash_status(interaction: discord.Interaction):
     embed = {"title":"📊  SNJ Mesh Weather Bot — Status",
              "color":0x57F287 if not cb_lines else 0xFFD700,
              "fields":fields,
-             "footer":{"text":f"v2.7.2 | Started {start_str}"}}
+             "footer":{"text":f"v2.7.4 | Started {start_str}"}}
     await interaction.followup.send(embed=discord.Embed.from_dict(embed), ephemeral=True)
 
 
@@ -1912,5 +2181,38 @@ async def slash_status(interaction: discord.Interaction):
 if __name__ == "__main__":
     if DISCORD_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         sys.exit("ERROR: discord_bot_token not set in config.json.")
-    log.info("SNJ Mesh Weather Bot v2.7.2 starting")
-    bot.run(DISCORD_BOT_TOKEN, log_handler=None)
+    log.info("SNJ Mesh Weather Bot v2.7.4 starting")
+    try:
+        bot.run(DISCORD_BOT_TOKEN, log_handler=None)
+    except discord.LoginFailure:
+        log.error("Discord login failed: token rejected")
+        sys.exit("\nERROR: Discord rejected the bot token.\n"
+                 "       Check discord_bot_token in config.json — it must be a\n"
+                 "       BOT token from the Developer Portal's Bot tab (not a\n"
+                 "       client secret, and not an OAuth code). Regenerating the\n"
+                 "       token invalidates the old one, so update config.json too.")
+    except discord.PrivilegedIntentsRequired:
+        log.error("Discord login failed: privileged intents required")
+        sys.exit("\nERROR: Discord requires privileged intents this bot has not\n"
+                 "       been granted. Enable them on the Bot tab of the\n"
+                 "       Developer Portal, or run an unmodified copy of this bot\n"
+                 "       (it only needs default intents).")
+    except aiohttp.ClientConnectorError as e:
+        log.error(f"Could not reach Discord at startup: {type(e).__name__}: {e}")
+        sys.exit(f"\nERROR: could not connect to Discord ({e}).\n"
+                 f"       Check this host's network connection and retry.")
+    except discord.HTTPException as e:
+        log.error(f"Discord HTTP error at startup: {e.status} {e.text}")
+        sys.exit(f"\nERROR: Discord returned HTTP {e.status} during login.\n"
+                 f"       {e.text or 'No detail provided.'}\n"
+                 f"       If this is a 5xx, Discord may be having an outage — "
+                 f"retry shortly.")
+    except KeyboardInterrupt:
+        log.info("Shutdown requested (KeyboardInterrupt)")
+    except Exception as e:
+        # Last resort: full traceback to the log file, one clean line to the
+        # console, so an unexpected startup failure is diagnosable without
+        # dumping a stack trace at whoever is running the bot.
+        log.exception("Fatal error during startup")
+        sys.exit(f"\nERROR: unexpected startup failure: {type(e).__name__}: {e}\n"
+                 f"       Full traceback written to {LOG_FILE}")

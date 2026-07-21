@@ -18,7 +18,7 @@ Conditions are pulled from a personal weather station (PWS) via the Aeris/Xweath
 
 ## Coverage area
 
-Alerts are matched against the 7 Southern NJ counties by NWS UGC code — Atlantic, Burlington, Camden, Cape May, Cumberland, Gloucester, and Salem — using the specific forecast zones NWS Mount Holly issues for them:
+Alerts are matched by NWS UGC code against the counties and forecast zones listed under `coverage` in `config.json`. The default (used when the key is omitted) is the 7 Southern NJ counties served by NWS Mount Holly:
 
 | Zone | County | Zone | County |
 |---|---|---|---|
@@ -28,7 +28,37 @@ Alerts are matched against the 7 Southern NJ counties by NWS UGC code — Atlant
 | NJZ019 | NW Burlington | NJZ025 | Coastal Atlantic |
 | NJZ021 | Cumberland | NJZ027 | SE Burlington |
 
-Ocean, Mercer, Middlesex, Monmouth, and every other NJ county are intentionally excluded. An alert only needs to touch *one* of the zones/counties above to post — a storm spanning both Southern and Central NJ will still show up.
+Ocean, Mercer, Middlesex, Monmouth, and every other NJ county are excluded by default. An alert only needs to touch *one* configured zone or county to post — a storm spanning both Southern and Central NJ will still show up.
+
+To narrow or change the area, set `coverage` explicitly. Atlantic County only:
+
+```json
+"coverage": {
+    "Atlantic": { "county_code": "NJC001", "zones": ["NJZ022", "NJZ025"] }
+}
+```
+
+Each entry needs a `county_code` (a `C` UGC code, matched against warnings issued by county) and its `zones` (`Z` UGC codes, matched against zone-based alerts). Both lists are validated at startup, so a typo like `NJZ22` is reported as a config error rather than silently shrinking your coverage. The zone→county mapping used for NWS link buttons is derived from this same block, so it can't fall out of sync.
+
+> **Match zones by code, not by name.** `NJZ024` is called *Atlantic Coastal Cape May* but belongs to **Cape May** County, not Atlantic.
+
+Two ready-to-edit examples ship with the repo: `config.example.southern-nj.json` (all 7 counties) and `config.example.atlantic.json` (Atlantic only).
+
+## Running more than one guild
+
+The bot serves one channel in one guild per process. To cover a second guild with a different area, run a **second instance of the same code** with its own config.
+
+```bash
+git clone https://github.com/jschollenberger/discord-weather-bot.git bot-southern-nj
+git clone https://github.com/jschollenberger/discord-weather-bot.git bot-atlantic
+```
+
+Give each its own `config.json`. State, logs, and config are resolved next to `weather_bot.py`, so separate directories keep the two instances fully isolated with no code changes.
+
+Two things to get right:
+
+- **Use a separate Discord application and bot token per instance.** Sharing one token means both processes receive the same slash-command interactions; one wins and the other errors on an already-acknowledged interaction, which users see as flaky commands.
+- **Upstream calls scale with instances.** Two instances double the NWS, AirNow, and PWS requests. That's comfortably within NWS and AirNow limits at default intervals, but check your Xweather plan's request quota.
 
 ## Commands
 
@@ -57,10 +87,10 @@ No privileged Gateway Intents are needed — the bot runs on `discord.Intents.de
 ## Setup
 
 ```bash
-git clone https://github.com/<you>/<repo>.git
-cd <repo>
+git clone https://github.com/jschollenberger/discord-weather-bot.git
+cd discord-weather-bot
 pip install -r requirements.txt
-cp config.example.json config.json
+cp config.example.southern-nj.json config.json
 ```
 
 Fill in `config.json` with your credentials (see reference below), then run:
@@ -80,7 +110,8 @@ Startup validates `config.json` and exits with a specific, readable error for an
 | `discord_bot_token` | — | **Required.** From the Discord Developer Portal |
 | `discord_channel_id` | — | Channel the bot posts conditions and alerts to |
 | `discord_guild_id` | none | Optional — enables near-instant slash-command sync for one server instead of the ~1 hour global sync |
-| `location_name` | "Southern NJ" | Display name used in embeds |
+| `location_name` | "Southern NJ" | Display name used in embeds and slash-command descriptions (keep under 40 chars) |
+| `coverage` | 7 Southern NJ counties | Counties and NWS zones to match alerts against — see [Coverage area](#coverage-area) |
 | `conditions_update_mins` | 30 | How often the conditions message refreshes |
 | `conditions_repost_hours` | 4 | Repost as a new message (instead of editing) after this long |
 | `pin_conditions_message` | true | Pin the conditions message |
@@ -100,15 +131,15 @@ Suppressed or below-threshold alerts still show up in `/alerts` — they're just
 This is a single long-running process with no built-in daemonization. Run it under `systemd`, `tmux`/`screen`, `pm2`, or your process supervisor of choice so it restarts if it ever exits. Logs go to `weather-bot.log`, with the previous run kept as `weather-bot.log.1`. `state.json` self-trims resolved alert entries older than 48 hours, so it won't grow without bound.
 
 ## Development
- 
+
 CI (GitHub Actions) runs lint, a compile check, and the test suite on Python 3.10–3.12 for every push and PR. To run the same checks locally:
- 
+
 ```bash
 pip install ruff pytest
 ruff check weather_bot.py tests/
 pytest
 ```
- 
+
 The tests in `tests/` are regression tests for logic that has actually failed in the past — the Southern-NJ geography filter, the zone→county fallback table, update-chain reference resolution, and state pruning. If you touch any of that, run them.
 
 ## Data sources
@@ -127,4 +158,4 @@ Independent project — not affiliated with or endorsed by NOAA, NWS, EPA, or NH
 
 ---
 
-*Built by compy / KD2QED.*
+*Built by Jason Schollenberger KD2QED*

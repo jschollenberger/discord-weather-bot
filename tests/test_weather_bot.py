@@ -2,43 +2,67 @@
 Regression tests for SNJ Mesh Weather Bot.
 
 These cover the pure logic that has actually bitten in production:
-  * the Southern-NJ geography filter  (v2.7 posted out-of-area alerts)
-  * the NJZ->NJC fallback table       (v2.7's table was shifted by one zone)
-  * update-chain reference resolution (v2.7.1 latched onto old ancestors)
-  * the posted_alerts prune predicate (v2.7 grew state.json without bound)
+  * the coverage-area filter        (v2.7 posted out-of-area alerts)
+  * the zone->county derivation     (v2.7's hand-kept table was shifted)
+  * update-chain reference matching (v2.7.1 latched onto old ancestors)
+  * the posted_alerts prune         (v2.7 grew state.json without bound)
+  * coverage config validation      (v2.7.3)
 
-weather_bot.py executes config loading (and may sys.exit) at import time, so
-instead of importing it we exec the relevant self-contained source blocks.
+weather_bot.py loads config (and may sys.exit) at import time, so rather than
+importing it we exec the relevant self-contained source blocks.
 Run from the repo root:  pytest
 """
 import re
 from pathlib import Path
 
+import pytest
+
 SRC = (Path(__file__).resolve().parent.parent / "weather_bot.py").read_text(encoding="utf-8")
 
 
-def _exec_block(start_marker: str, end_marker: str) -> dict:
+def _exec_block(start_marker: str, end_marker: str, ns: dict | None = None) -> dict:
     start = SRC.index(start_marker)
     end   = SRC.index(end_marker, start)
-    ns: dict = {}
+    ns = {} if ns is None else ns
     exec(SRC[start:end], ns)  # noqa: S102 - executing our own source under test
     return ns
 
 
-# --- Geography block: sets + _is_snj_zone + _affects_southern_nj -------------
-geo = _exec_block("_SOUTHERN_NJ_COUNTIES = frozenset", "def _snj_area_str")
-_affects_southern_nj = geo["_affects_southern_nj"]
-_is_snj_zone         = geo["_is_snj_zone"]
-_SNJ_ZONE_CODES      = geo["_SNJ_ZONE_CODES"]
-_SNJ_COUNTY_CODES    = geo["_SNJ_COUNTY_CODES"]
+# --- Coverage block ----------------------------------------------------------
+# `_cfg` is stubbed empty so COVERAGE falls back to DEFAULT_COVERAGE.
+geo = _exec_block("DEFAULT_COVERAGE: dict", "def _nws_human_url", {"_cfg": {}})
+DEFAULT_COVERAGE       = geo["DEFAULT_COVERAGE"]
+_derive_coverage       = geo["_derive_coverage"]
+_in_coverage           = geo["_in_coverage"]
+_is_coverage_zone      = geo["_is_coverage_zone"]
+_COVERAGE_ZONES        = geo["_COVERAGE_ZONES"]
+_COVERAGE_COUNTY_CODES = geo["_COVERAGE_COUNTY_CODES"]
+_ZONE_TO_COUNTY        = geo["_ZONE_TO_COUNTY"]
 
-# --- Fallback table ----------------------------------------------------------
-fb = _exec_block("_NJZ_COUNTY_FALLBACK: dict", "def _nws_human_url")
-_NJZ_COUNTY_FALLBACK = fb["_NJZ_COUNTY_FALLBACK"]
+# --- Config validation -------------------------------------------------------
+val = _exec_block("_THRESHOLD_TIER = ", "_cfg = _load_config()", {"re": re})
+_validate_coverage = val["_validate_coverage"]
+_validate_config   = val["_validate_config"]
+_config_warnings   = val["_config_warnings"]
 
-# --- Reference-chain resolution ---------------------------------------------
+MINIMAL_OK = {
+    "pws_station_id": "STN", "pws_client_id": "cid",
+    "pws_client_secret": "sec", "discord_bot_token": "tok",
+}
+
+
+def cfg(**over):
+    c = dict(MINIMAL_OK)
+    c.update(over)
+    return c
+
+# --- Reference-chain matching ------------------------------------------------
 ref = _exec_block("def _find_ref_in_posted", "\nasync def fetch_tides")
 _find_ref_in_posted = ref["_find_ref_in_posted"]
+
+
+ATLANTIC_ONLY = {"Atlantic": {"county_code": "NJC001",
+                              "zones": ["NJZ022", "NJZ025"]}}
 
 
 def feat(ugc, area="", headline=""):
@@ -46,91 +70,346 @@ def feat(ugc, area="", headline=""):
                            "areaDesc": area, "headline": headline}}
 
 
+def make_filter(cov):
+    """Build an _in_coverage bound to an arbitrary coverage config."""
+    names, counties, zones, _ = _derive_coverage(cov)
+    ns = dict(_COVERAGE_NAMES=names, _COVERAGE_COUNTY_CODES=counties,
+              _COVERAGE_ZONES=zones)
+    return _exec_block("def _in_coverage", "def _coverage_area_str",
+                       ns)["_in_coverage"]
+
+
 # ============================================================================
-# Geography filter
+# Coverage filter - default (7-county Southern NJ)
 # ============================================================================
 
-class TestAffectsSouthernNJ:
+class TestDefaultCoverage:
     # --- regressions: the exact alert shapes that leaked in v2.7 ---
     def test_mercer_middlesex_monmouth_county_codes_excluded(self):
         f = feat(["NJC021", "NJC023", "NJC025"],
                  "Mercer, NJ; Middlesex, NJ; Monmouth, NJ")
-        assert _affects_southern_nj(f) is False
+        assert _in_coverage(f) is False
 
     def test_hunterdon_somerset_flash_flood_excluded(self):
         f = feat(["NJC019", "NJC021", "NJC023", "NJC035"],
                  "Hunterdon, NJ; Mercer, NJ; Middlesex, NJ; Somerset, NJ")
-        assert _affects_southern_nj(f) is False
+        assert _in_coverage(f) is False
 
-    def test_coastal_ocean_zone_excluded(self):
-        assert _affects_southern_nj(feat(["NJZ026"], "Coastal Ocean")) is False
-
-    def test_inland_ocean_zone_excluded(self):
-        assert _affects_southern_nj(feat(["NJZ020"], "Ocean")) is False
-
-    def test_mercer_zone_excluded(self):
-        assert _affects_southern_nj(feat(["NJZ015"], "Mercer")) is False
+    @pytest.mark.parametrize("zone,label", [
+        ("NJZ026", "Coastal Ocean"), ("NJZ020", "Ocean"), ("NJZ015", "Mercer")])
+    def test_out_of_area_zones_excluded(self, zone, label):
+        assert _in_coverage(feat([zone], label)) is False
 
     def test_monmouth_plus_coastal_ocean_combo_excluded(self):
         f = feat(["NJZ014", "NJZ026"], "Eastern Monmouth; Coastal Ocean")
-        assert _affects_southern_nj(f) is False
+        assert _in_coverage(f) is False
 
     # --- in-scope alerts must still post ---
     def test_atlantic_county_code_included(self):
-        assert _affects_southern_nj(feat(["NJC001"], "Atlantic, NJ")) is True
+        assert _in_coverage(feat(["NJC001"], "Atlantic, NJ")) is True
 
     def test_all_ten_southern_zones_included(self):
-        f = feat(sorted(_SNJ_ZONE_CODES),
+        f = feat(sorted(_COVERAGE_ZONES),
                  "Salem; Gloucester; Camden; Northwestern Burlington; "
                  "Cumberland; Atlantic; Cape May; Atlantic Coastal Cape May; "
                  "Coastal Atlantic; Southeastern Burlington")
-        assert _affects_southern_nj(f) is True
+        assert _in_coverage(f) is True
 
     def test_multicounty_storm_clipping_burlington_included(self):
         f = feat(["NJC021", "NJC005"], "Mercer, NJ; Burlington, NJ")
-        assert _affects_southern_nj(f) is True
+        assert _in_coverage(f) is True
 
-    def test_each_southern_zone_included_individually(self):
-        for z in _SNJ_ZONE_CODES:
-            assert _affects_southern_nj(feat([z])) is True, z
+    def test_every_configured_zone_included_individually(self):
+        for z in _COVERAGE_ZONES:
+            assert _in_coverage(feat([z])) is True, z
 
-    def test_each_southern_county_code_included_individually(self):
-        for c in _SNJ_COUNTY_CODES:
-            assert _affects_southern_nj(feat([c])) is True, c
+    def test_every_configured_county_included_individually(self):
+        for c in _COVERAGE_COUNTY_CODES:
+            assert _in_coverage(feat([c])) is True, c
 
     # --- fallback path (no UGC) ---
     def test_no_ugc_falls_back_to_county_names(self):
-        assert _affects_southern_nj(feat([], "Cape May; Cumberland")) is True
+        assert _in_coverage(feat([], "Cape May; Cumberland")) is True
 
     def test_no_ugc_out_of_area(self):
-        assert _affects_southern_nj(feat([], "Bergen; Passaic")) is False
+        assert _in_coverage(feat([], "Bergen; Passaic")) is False
 
 
-class TestZoneSets:
-    def test_excluded_zones_not_in_set(self):
-        for z in ("NJZ015", "NJZ020", "NJZ026"):   # Mercer, Ocean, Coastal Ocean
-            assert not _is_snj_zone(z), z
+class TestDefaultCoverageShape:
+    def test_ten_zones_seven_counties(self):
+        assert len(_COVERAGE_ZONES) == 10
+        assert len(_COVERAGE_COUNTY_CODES) == 7
+        assert len(DEFAULT_COVERAGE) == 7
 
-    def test_zone_set_has_exactly_ten_zones(self):
-        assert len(_SNJ_ZONE_CODES) == 10
+    @pytest.mark.parametrize("zone", ["NJZ015", "NJZ020", "NJZ026"])
+    def test_excluded_zones_not_in_set(self, zone):
+        assert not _is_coverage_zone(zone)
 
-    def test_county_set_has_exactly_seven_counties(self):
-        assert len(_SNJ_COUNTY_CODES) == 7
+    def test_zone_to_county_covers_every_zone(self):
+        assert set(_ZONE_TO_COUNTY) == set(_COVERAGE_ZONES)
+        assert set(_ZONE_TO_COUNTY.values()) <= set(_COVERAGE_COUNTY_CODES)
 
-    def test_fallback_covers_every_zone_and_maps_to_southern_counties(self):
-        assert set(_NJZ_COUNTY_FALLBACK) == set(_SNJ_ZONE_CODES)
-        assert set(_NJZ_COUNTY_FALLBACK.values()) <= set(_SNJ_COUNTY_CODES)
+    def test_njz024_maps_to_cape_may_not_atlantic(self):
+        """'Atlantic Coastal Cape May' is a Cape May zone despite the name."""
+        assert _ZONE_TO_COUNTY["NJZ024"] == "NJC009"
+        assert _ZONE_TO_COUNTY["NJZ025"] == "NJC001"
 
 
 # ============================================================================
-# Update-chain reference resolution  (v2.7.2 regression)
+# Coverage filter - Atlantic County only  (second-guild deployment)
+# ============================================================================
+
+class TestAtlanticOnlyCoverage:
+    filt = staticmethod(make_filter(ATLANTIC_ONLY))
+
+    def test_atlantic_zones_included(self):
+        for z in ("NJZ022", "NJZ025"):
+            assert self.filt(feat([z])) is True, z
+
+    def test_atlantic_county_code_included(self):
+        assert self.filt(feat(["NJC001"], "Atlantic, NJ")) is True
+
+    @pytest.mark.parametrize("zone", [
+        "NJZ016", "NJZ017", "NJZ018", "NJZ019", "NJZ021", "NJZ023", "NJZ027"])
+    def test_other_southern_nj_zones_excluded(self, zone):
+        assert self.filt(feat([zone])) is False
+
+    def test_njz024_excluded_despite_atlantic_in_its_name(self):
+        """NJZ024 'Atlantic Coastal Cape May' is Cape May - must NOT match."""
+        assert self.filt(feat(["NJZ024"], "Atlantic Coastal Cape May")) is False
+
+    def test_storm_spanning_atlantic_and_cape_may_still_posts(self):
+        assert self.filt(feat(["NJC001", "NJC009"],
+                              "Atlantic, NJ; Cape May, NJ")) is True
+
+    def test_cape_may_only_storm_excluded(self):
+        assert self.filt(feat(["NJC009"], "Cape May, NJ")) is False
+
+    def test_derived_sets(self):
+        names, counties, zones, z2c = _derive_coverage(ATLANTIC_ONLY)
+        assert names == {"Atlantic"}
+        assert counties == {"NJC001"}
+        assert zones == {"NJZ022", "NJZ025"}
+        assert z2c == {"NJZ022": "NJC001", "NJZ025": "NJC001"}
+
+
+# ============================================================================
+# Coverage config validation
+# ============================================================================
+
+class TestValidateCoverage:
+    def test_absent_coverage_is_valid(self):
+        assert _validate_coverage(None) == []
+
+    def test_default_coverage_is_valid(self):
+        assert _validate_coverage(DEFAULT_COVERAGE) == []
+
+    def test_atlantic_only_is_valid(self):
+        assert _validate_coverage(ATLANTIC_ONLY) == []
+
+    def test_empty_object_rejected(self):
+        assert _validate_coverage({}) != []
+
+    def test_wrong_type_rejected(self):
+        assert _validate_coverage(["NJZ022"]) != []
+
+    def test_typo_zone_code_rejected(self):
+        cov = {"Atlantic": {"county_code": "NJC001", "zones": ["NJZ22"]}}
+        assert any("NJZ22" in e for e in _validate_coverage(cov))
+
+    def test_county_code_in_zones_rejected(self):
+        cov = {"Atlantic": {"county_code": "NJC001", "zones": ["NJC001"]}}
+        assert any("county code" in e for e in _validate_coverage(cov))
+
+    def test_zone_code_as_county_code_rejected(self):
+        cov = {"Atlantic": {"county_code": "NJZ022", "zones": ["NJZ022"]}}
+        assert any("zone code" in e for e in _validate_coverage(cov))
+
+    def test_entry_with_no_zones_or_county_rejected(self):
+        assert _validate_coverage({"Nowhere": {}}) != []
+
+    def test_zones_not_a_list_rejected(self):
+        cov = {"Atlantic": {"county_code": "NJC001", "zones": "NJZ022"}}
+        assert _validate_coverage(cov) != []
+
+
+# ============================================================================
+# Config validation - required fields and hard errors
+# ============================================================================
+
+class TestValidateConfig:
+    def test_minimal_valid_config_passes(self):
+        assert _validate_config(cfg()) == []
+
+    @pytest.mark.parametrize("key", [
+        "pws_station_id", "pws_client_id", "pws_client_secret", "discord_bot_token"])
+    def test_missing_required_field_is_error(self, key):
+        c = cfg()
+        del c[key]
+        assert any(key in e for e in _validate_config(c))
+
+    @pytest.mark.parametrize("key", [
+        "pws_station_id", "pws_client_id", "pws_client_secret", "discord_bot_token"])
+    def test_unreplaced_placeholder_is_error(self, key):
+        assert any(key in e for e in _validate_config(cfg(**{key: "YOUR_TOKEN"})))
+
+    # --- settings that used to misconfigure SILENTLY ---
+    @pytest.mark.parametrize("bad", ["Warning", "warnings", "WARNING", "none", ""])
+    def test_bad_alert_post_threshold_is_error(self, bad):
+        """An unrecognised threshold silently meant 'all' before v2.7.4,
+        quietly posting every advisory."""
+        errs = _validate_config(cfg(alert_post_threshold=bad))
+        assert any("alert_post_threshold" in e for e in errs)
+
+    @pytest.mark.parametrize("good", ["all", "watch", "warning"])
+    def test_valid_alert_post_threshold_accepted(self, good):
+        assert _validate_config(cfg(alert_post_threshold=good)) == []
+
+    def test_string_suppress_types_is_error(self):
+        """set('Small Craft Advisory') is a set of CHARACTERS - matches nothing."""
+        errs = _validate_config(cfg(alert_suppress_types="Small Craft Advisory"))
+        assert any("alert_suppress_types" in e for e in errs)
+
+    def test_non_string_entries_in_suppress_types_is_error(self):
+        errs = _validate_config(cfg(alert_suppress_types=["ok", 5]))
+        assert any("alert_suppress_types" in e for e in errs)
+
+    def test_empty_suppress_list_is_fine(self):
+        assert _validate_config(cfg(alert_suppress_types=[])) == []
+
+    # --- numeric guards ---
+    @pytest.mark.parametrize("key,bad", [
+        ("forecast_lat", "abc"), ("forecast_lon", "xyz"),
+        ("alert_interval_secs", "soon"), ("conditions_update_mins", "half"),
+        ("aqi_alert_threshold", "high"), ("weekly_summary_day", "Sunday"),
+        ("weekly_summary_hour", "8am")])
+    def test_non_numeric_values_error_not_crash(self, key, bad):
+        errs = _validate_config(cfg(**{key: bad}))
+        assert any(key in e for e in errs)
+
+    @pytest.mark.parametrize("key", ["forecast_lat", "forecast_lon"])
+    def test_null_latlon_means_unset_and_is_accepted(self, key):
+        """Explicit null falls back to the built-in default, so it is valid."""
+        assert _validate_config(cfg(**{key: None})) == []
+
+    @pytest.mark.parametrize("key,bad", [
+        ("forecast_lat", 91), ("forecast_lon", -181),
+        ("alert_interval_secs", 30), ("conditions_update_mins", 1),
+        ("aqi_alert_threshold", 7), ("weekly_summary_day", 9),
+        ("weekly_summary_hour", 24)])
+    def test_out_of_range_values_error(self, key, bad):
+        errs = _validate_config(cfg(**{key: bad}))
+        assert any(key in e for e in errs)
+
+    def test_long_location_name_is_error(self):
+        """Interpolated into slash-command descriptions, capped at 100 by Discord."""
+        errs = _validate_config(cfg(location_name="X" * 60))
+        assert any("location_name" in e for e in errs)
+
+    def test_non_numeric_channel_id_is_error(self):
+        errs = _validate_config(cfg(discord_channel_id="not-an-id"))
+        assert any("discord_channel_id" in e for e in errs)
+
+    def test_bad_coverage_surfaces_through_validate_config(self):
+        c = cfg(coverage={"Atlantic": {"county_code": "NJC001", "zones": ["NJZ22"]}})
+        assert any("coverage" in e for e in _validate_config(c))
+
+
+# ============================================================================
+# Config warnings - skippable settings must warn, never block
+# ============================================================================
+
+class TestConfigWarnings:
+    def test_bare_config_warns_about_each_optional_feature(self):
+        w = " ".join(_config_warnings(cfg()))
+        for key in ("discord_channel_id", "discord_guild_id",
+                    "airnow_api_key", "coverage"):
+            assert key in w, key
+
+    def test_fully_specified_config_has_no_warnings(self):
+        c = cfg(discord_channel_id="123", discord_guild_id="456",
+                airnow_api_key="key", coverage=ATLANTIC_ONLY)
+        assert _config_warnings(c) == []
+
+    def test_warnings_are_not_errors(self):
+        """A config that only trips warnings must still validate cleanly."""
+        assert _validate_config(cfg()) == []
+        assert _config_warnings(cfg()) != []
+
+    def test_airnow_key_present_suppresses_that_warning(self):
+        w = " ".join(_config_warnings(cfg(airnow_api_key="k")))
+        assert "airnow_api_key" not in w
+
+
+# ============================================================================
+# Log redaction - credentials must never reach the log file
+# ============================================================================
+
+class TestRedactFilter:
+    """aiohttp puts the full request URL in its exception text, and the Aeris
+    and AirNow endpoints carry credentials in the query string, so an HTTP
+    error would otherwise write them to weather-bot.log in the clear."""
+
+    ID, SECRET, TOKEN = "REAL_ID_12345678", "REAL_SECRET_ABCDEF", "MTUxNjc0.tok.en"
+
+    @classmethod
+    def setup_class(cls):
+        import logging as _logging
+        ns = _exec_block("class _RedactFilter", "_redactor = _RedactFilter()",
+                         {"logging": _logging})
+        cls.F = ns["_RedactFilter"]
+        cls.F.set_secrets(cls.ID, cls.SECRET, cls.TOKEN, None, "", "short")
+        cls.filt = cls.F()
+        cls._logging = _logging
+
+    def scrub(self, msg, args=None):
+        rec = self._logging.LogRecord("t", 40, "", 1, msg, args, None)
+        self.filt.filter(rec)
+        return rec.msg, rec.args
+
+    def test_airnow_key_in_url_redacted(self):
+        msg, _ = self.scrub(
+            f"AirNow fetch failed: 500, url='https://airnowapi.org/x?API_KEY={self.SECRET}'")
+        assert self.SECRET not in msg
+        assert "REDACTED" in msg
+
+    def test_aeris_credentials_in_url_redacted(self):
+        msg, _ = self.scrub(
+            f"conditions: url='https://api.aerisapi.com/x"
+            f"?client_id={self.ID}&client_secret={self.SECRET}'")
+        assert self.ID not in msg and self.SECRET not in msg
+
+    def test_bot_token_redacted(self):
+        msg, _ = self.scrub(f"logging in with {self.TOKEN}")
+        assert self.TOKEN not in msg
+
+    def test_args_are_scrubbed_too(self):
+        _, args = self.scrub("value=%s", (self.SECRET,))
+        assert self.SECRET not in args[0]
+
+    def test_short_and_empty_values_not_registered(self):
+        """Short strings would redact innocuous substrings all over the log."""
+        assert "short" not in self.F._secrets
+        assert "" not in self.F._secrets
+        assert None not in self.F._secrets
+
+    def test_ordinary_message_untouched(self):
+        msg, _ = self.scrub("Checking NWS alerts")
+        assert msg == "Checking NWS alerts"
+
+    def test_filter_always_returns_true(self):
+        """Returning False would silently drop the record entirely."""
+        rec = self._logging.LogRecord("t", 40, "", 1, "x", None, None)
+        assert self.filt.filter(rec) is True
+
+
+# ============================================================================
+# Update-chain reference matching  (v2.7.2 regression)
 # ============================================================================
 
 class TestFindRefInPosted:
-    posted = {
-        "aid_A": {"message_id": "1000", "ts": 1000},
-        "aid_B": {"message_id": "2000", "ts": 2000},
-    }
+    posted = {"aid_A": {"message_id": "1000", "ts": 1000},
+              "aid_B": {"message_id": "2000", "ts": 2000}}
 
     def test_oldest_first_reference_order(self):
         refs = [{"identifier": "aid_A"}, {"identifier": "aid_B"}]
@@ -184,16 +463,9 @@ class TestPrune:
                       SRC)
         assert m, "prune logic in _task_alerts changed - update tests/test_weather_bot.py"
 
-    def test_old_superseded_entry_pruned(self):
-        p = {"a": {"ts": self.OLD, "superseded_by": "b"}}
-        assert prune(p, set(), self.NOW) == {}
-
-    def test_old_suppressed_entry_pruned(self):
-        p = {"a": {"ts": self.OLD, "suppressed": True}}
-        assert prune(p, set(), self.NOW) == {}
-
-    def test_old_cleared_entry_pruned(self):
-        p = {"a": {"ts": self.OLD, "cleared": True}}
+    @pytest.mark.parametrize("flag", ["cleared", "superseded_by", "suppressed"])
+    def test_old_resolved_entry_pruned(self, flag):
+        p = {"a": {"ts": self.OLD, flag: True}}
         assert prune(p, set(), self.NOW) == {}
 
     def test_recent_resolved_entry_kept(self):
