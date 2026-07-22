@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-SNJ Mesh Weather Bot
-Copyright (C) 2026 compy (KD2QED)
+SNJ Mesh Weather Bot — a Discord bot for a configurable NWS coverage area.
+
+Posts live conditions from a personal weather station, NWS alerts, tides, air
+quality and Atlantic tropical storm updates to a Discord channel, and answers
+slash commands for on-demand lookups.
+
+Usage:
+    python weather_bot.py [--data-dir DIR] [--config FILE]
+
+Configuration lives in config.json — see config.example.*.json and README.md.
+Release history is in CHANGELOG.md.
+
+Copyright (C) 2026 Jason Schollenberger (KD2QED)
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -15,122 +26,9 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program. If not, see <https://www.gnu.org/licenses/>.
-
----
-
-SNJ Mesh Weather Bot v2.7.5
-Changes from v2.7.4:
-- NEW: --data-dir / --config command-line flags (env: SNJ_BOT_DIR,
-  SNJ_BOT_CONFIG) so a single checkout can run several instances, each with
-  its own config.json, state.json and log in a separate directory.
-- NEW: radar station is configurable (radar_station / radar_station_name /
-  radar_region) instead of being hardcoded to KDIX.
-- NEW: /radar attaches the live NWS RIDGE loop image instead of only linking
-  to it.  The image is fetched and uploaded rather than hotlinked, because
-  Discord's CDN caches embed image URLs and would serve a stale frame.
-  Falls back to link-only if the fetch fails.  Disable with
-  radar_attach_image: false.
-- /status now shows the configured coverage and radar station, and puts
-  location_name in the title, so multiple instances are distinguishable.
-
-SNJ Mesh Weather Bot v2.7.4
-Changes from v2.7.3:
-- SECURITY: credentials could be written to weather-bot.log in the clear.
-  aiohttp includes the full request URL in its exception text, and the
-  Aeris and AirNow endpoints carry credentials in the query string, so any
-  HTTP error from those services logged client_secret / API_KEY verbatim.
-  A logging filter now redacts all known secrets from every log record.
-- FIX: on_ready is re-dispatched by discord.py whenever a session cannot be
-  RESUMED, which started a SECOND scheduler — double-posting every
-  conditions update and every alert.  One-time setup now runs exactly once,
-  while channel resolution stays retryable so a reconnect can recover a
-  startup that failed to resolve the channel.
-- FIX: an unrecognised alert_post_threshold (e.g. "Warning", "warnings")
-  silently fell back to "all", quietly posting every advisory.  Now a
-  startup error.
-- FIX: alert_suppress_types given as a bare string became a set of single
-  CHARACTERS and silently matched nothing.  Now a startup error.
-- FIX: malformed or non-object config.json raised a raw JSONDecodeError
-  traceback; now reports the line and column of the syntax error.
-- FIX: an invalid bot token, missing intents, Discord outage, or network
-  failure at startup raised a raw traceback; each now exits with an
-  actionable message, with the full traceback written to the log.
-- NEW: config warnings for skippable settings (no channel id, no guild id,
-  no AirNow key, no coverage block) — reported at startup without blocking.
-- NEW: channel resolution retries with backoff instead of leaving the bot
-  permanently idle after one transient failure at startup.
-
-SNJ Mesh Weather Bot v2.7.3
-Changes from v2.7.2:
-- NEW: coverage area is now configurable via the "coverage" key in
-  config.json, so one codebase can serve multiple guilds with different
-  scopes (e.g. all of Southern NJ vs. Atlantic County only) without
-  forking.  Omitting the key keeps the previous 7-county behavior.
-- The zone list, county-code list, county-name list and zone->county table
-  are now all DERIVED from that single mapping, so they cannot drift apart.
-  (The hand-maintained zone->county table was wrong for 9 of 10 zones in
-  v2.7.)
-- Coverage config is validated at startup: malformed UGC codes, zone codes
-  used where county codes belong (and vice versa), and empty coverage are
-  reported as normal config errors instead of silently matching nothing.
-- Region-specific display strings now follow location_name / coverage
-  rather than being hardcoded to "Southern NJ" and the 7-county list.
-- Renamed for region-neutrality: _affects_southern_nj -> _in_coverage,
-  _snj_area_str -> _coverage_area_str, _is_snj_zone -> _is_coverage_zone,
-  _SNJ_* -> _COVERAGE_*, _NJZ_COUNTY_FALLBACK -> _ZONE_TO_COUNTY.
-
-Changes from v2.7.1:
-- FIX: _find_ref_in_posted() matched the first reference found in an update's
-  `references` list, not necessarily the immediate predecessor.  NWS often
-  lists the entire update chain (not just the last hop), so on a 2nd+ update
-  this could latch onto an older ancestor still in `posted`, misdirecting
-  reply-threading and leaving the true immediate predecessor to fall through
-  to the natural-expiry clear path instead.  Now matches by most recent `ts`
-  among all candidates, independent of list order.
-
-Changes from v2.7.1:
-- FIX: alert geography — UGC codes are now matched against explicit,
-  verified NWS zone/county sets instead of a numeric 15-27 range.  The old
-  range misread county codes (NJC021/023/025 = Mercer/Middlesex/Monmouth)
-  and included zones NJZ015/020/026 (Mercer, Ocean, Coastal Ocean), so
-  out-of-area alerts were posting.  Ocean County is now excluded.
-- FIX: _NJZ_COUNTY_FALLBACK zone->county table was shifted by one zone;
-  "Active Alert" link buttons were built with the wrong county for most zones.
-- FIX: state.json unbounded growth — superseded and suppressed alert entries
-  are now pruned after 48 h (previously only cleared entries were, and
-  superseded/suppressed entries never became cleared).
-- FIX: an NWS alerts API outage no longer looks like "zero active alerts",
-  which could post false CLEARED messages for every live alert.  Fetch
-  failures now skip the cycle entirely.
-- FIX: _validate_config() now catches non-numeric forecast_lat/lon and the
-  interval/threshold/day/hour settings and reports them as a normal config
-  error instead of crashing on startup with a raw traceback.
-- FIX: exception log lines now include the exception type name, so failures
-  whose str() is empty (e.g. a bare TimeoutError) no longer log a blank,
-  useless line.
-- FIX: ConditionsRefreshView's per-user cooldown dict now sweeps stale
-  entries instead of growing for the life of the process.
-
-Changes from v2.6:
-- aiohttp replaces requests: all fetches are now native async coroutines;
-  asyncio.to_thread() eliminated entirely; a shared ClientSession is reused
-  across all calls and closed cleanly on shutdown
-- _http_get is async: retries use asyncio.sleep so the event loop is never blocked
-- fetch_forecast uses _http_get (was accidentally left using raw requests)
-- Atomic state writes: state.json written to .tmp then renamed so a crash
-  mid-write never corrupts the file
-- Scheduler body wrapped in try/except: an uncaught exception no longer
-  silently kills the loop
-- Circuit breaker per service: after 5 consecutive failures the service is
-  skipped for 30 min; after 10 for 2 h; resets on success
-- _fetch_and_build_conditions() helper: single coroutine used by the
-  scheduler, /conditions, and the Refresh button — no more three call sites
-  to keep in sync
-- /status command: uptime, last fetch times, active alerts, AQI category,
-  circuit-breaker status — ephemeral, works in DMs
-
-pip install discord.py aiohttp tzdata astral
 """
+
+__version__ = "2.7.6"
 
 import argparse
 import asyncio
@@ -371,6 +269,12 @@ def _validate_config(cfg: dict) -> list[str]:
         errs.append(f"  x radar_station: must be a 4-letter NWS radar code "
                     f"(e.g. KDIX), got {rad!r}")
 
+    # An unrecognised value would silently fall through to global-only sync.
+    csync = str(cfg.get("command_sync", "auto")).lower()
+    if csync not in ("auto", "global", "guild"):
+        errs.append(f"  x command_sync: must be auto, global, or guild "
+                    f"(got {cfg.get('command_sync')!r})")
+
     errs.extend(_validate_coverage(cfg.get("coverage")))
     return errs
 
@@ -473,6 +377,7 @@ RADAR_STATION           = str(_cfg.get("radar_station","KDIX")).upper()
 RADAR_STATION_NAME      = _cfg.get("radar_station_name","Fort Dix, NJ")
 RADAR_REGION            = _cfg.get("radar_region","northeast")
 RADAR_ATTACH_IMAGE      = bool(_cfg.get("radar_attach_image",True))
+COMMAND_SYNC            = str(_cfg.get("command_sync","auto")).lower()
 AIRNOW_KEY              = _cfg.get("airnow_api_key")
 AQI_THRESHOLD           = int(_cfg.get("aqi_alert_threshold",3))
 WEEKLY_DAY              = int(_cfg.get("weekly_summary_day",6))
@@ -522,7 +427,7 @@ RADAR_IMAGE_BASE    = "https://radar.weather.gov/ridge/standard"
 _RADAR_MAX_BYTES    = 8 * 1024 * 1024   # stay under Discord's attachment limit
 AIRNOW_FORECAST_URL = "https://www.airnowapi.org/aq/forecast/latLong/"
 NHC_STORMS_URL      = "https://www.nhc.noaa.gov/CurrentStorms.json"
-SNJ_UA              = "SNJMeshWeatherBot/2.7.5"
+SNJ_UA              = f"SNJMeshWeatherBot/{__version__}"
 
 # ---------------------------------------------------------------------------
 # Timezone
@@ -1943,6 +1848,47 @@ _HELP_EMBED = {
 _ready_once = False
 _scheduler_started = False
 
+async def _sync_commands() -> None:
+    """
+    Register slash commands in exactly ONE scope.
+
+    Discord stores global and guild command sets separately and shows BOTH in
+    the command picker, so syncing the same commands to both scopes makes
+    every command appear twice — the pre-v2.7.6 behavior, which registered
+    globally and then copied the same set into the guild.  We now pick one
+    scope and push an EMPTY set to the other, which also cleans up duplicates
+    left behind by an earlier version on the first run after upgrading.
+
+    guild scope : registers instantly, but commands do NOT work in DMs.
+    global scope: works everywhere including DMs, up to ~1h to propagate.
+    """
+    mode = COMMAND_SYNC
+    if mode == "auto":
+        mode = "guild" if DISCORD_GUILD_ID else "global"
+
+    if mode == "guild" and DISCORD_GUILD_ID:
+        guild = discord.Object(id=int(DISCORD_GUILD_ID))
+        tree.copy_global_to(guild=guild)
+        synced = await tree.sync(guild=guild)
+        # Drop global registrations so they cannot show up as duplicates
+        tree.clear_commands(guild=None)
+        await tree.sync()
+        log.info(f"Slash commands synced to guild {DISCORD_GUILD_ID}: "
+                 f"{len(synced)} commands (instant)")
+        log.info("Global command set cleared (prevents duplicate entries); "
+                 "note guild-scoped commands are not available in DMs")
+    else:
+        if DISCORD_GUILD_ID:
+            # Clear stale guild copies left by a previous guild-scoped sync
+            guild = discord.Object(id=int(DISCORD_GUILD_ID))
+            tree.clear_commands(guild=guild)
+            await tree.sync(guild=guild)
+            log.info(f"Guild {DISCORD_GUILD_ID} command set cleared "
+                     f"(prevents duplicate entries)")
+        synced = await tree.sync()
+        log.info(f"Slash commands synced globally: {len(synced)} commands "
+                 f"(DM access enabled; may take up to ~1h to appear)")
+
 async def _resolve_channel_with_retry(attempts: int = 4) -> None:
     """
     Resolve the posting channel, retrying a few times with backoff.
@@ -1980,13 +1926,7 @@ async def on_ready():
         _state      = load_state()
         _start_time = time.time()
         bot.add_view(ConditionsRefreshView())
-        await tree.sync()
-        log.info("Slash commands synced globally (DM access enabled)")
-        if DISCORD_GUILD_ID:
-            guild = discord.Object(id=int(DISCORD_GUILD_ID))
-            tree.copy_global_to(guild=guild)
-            await tree.sync(guild=guild)
-            log.info(f"Slash commands synced to guild {DISCORD_GUILD_ID} (instant)")
+        await _sync_commands()
     else:
         log.info("READY re-dispatched; retrying channel resolution")
 
@@ -2006,7 +1946,7 @@ async def on_ready():
     ch_name   = f"#{_channel.name}" if _channel else "unresolved"
     astral_ok = "enabled" if _ASTRAL_OK else "disabled (pip install astral)"
     print(f"\n{'─'*62}")
-    print(f"  SNJ Mesh Weather Bot v2.7.5|  {LOCATION_NAME}")
+    print(f"  SNJ Mesh Weather Bot v{__version__}|  {LOCATION_NAME}")
     print(f"  Station   : {PWS_STATION_ID}")
     print(f"  Channel   : {ch_name}")
     print(f"  Guild     : {DISCORD_GUILD_ID or 'global sync'}")
@@ -2292,7 +2232,7 @@ async def slash_status(interaction: discord.Interaction):
     embed = {"title":f"📊  SNJ Mesh Weather Bot — Status · {LOCATION_NAME}",
              "color":0x57F287 if not cb_lines else 0xFFD700,
              "fields":fields,
-             "footer":{"text":f"v2.7.5 | Started {start_str}"}}
+             "footer":{"text":f"v{__version__} | Started {start_str}"}}
     await interaction.followup.send(embed=discord.Embed.from_dict(embed), ephemeral=True)
 
 
@@ -2302,7 +2242,7 @@ async def slash_status(interaction: discord.Interaction):
 if __name__ == "__main__":
     if DISCORD_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         sys.exit("ERROR: discord_bot_token not set in config.json.")
-    log.info("SNJ Mesh Weather Bot v2.7.5 starting")
+    log.info(f"SNJ Mesh Weather Bot v{__version__} starting")
     try:
         bot.run(DISCORD_BOT_TOKEN, log_handler=None)
     except discord.LoginFailure:

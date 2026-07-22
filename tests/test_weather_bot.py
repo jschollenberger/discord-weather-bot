@@ -18,6 +18,38 @@ from pathlib import Path
 import pytest
 
 SRC = (Path(__file__).resolve().parent.parent / "weather_bot.py").read_text(encoding="utf-8")
+CHANGELOG = (Path(__file__).resolve().parent.parent / "CHANGELOG.md").read_text(encoding="utf-8")
+
+
+class TestVersion:
+    """__version__ is the single source of truth for the version string and
+    must match the newest released entry in CHANGELOG.md."""
+
+    def test_version_declared_once(self):
+        assert len(re.findall(r'^__version__ = "', SRC, re.M)) == 1
+
+    def test_version_matches_latest_changelog_entry(self):
+        declared = re.search(r'^__version__ = "([^"]+)"', SRC, re.M).group(1)
+        # first "## [x.y.z]" heading that isn't [Unreleased]
+        released = re.findall(r"^## \[(?!Unreleased)([^\]]+)\]", CHANGELOG, re.M)
+        assert released, "CHANGELOG.md has no released version headings"
+        assert declared == released[0], (
+            f"__version__ is {declared} but newest CHANGELOG entry is "
+            f"{released[0]}")
+
+    def test_changelog_versions_are_descending(self):
+        def key(v):
+            return tuple(int(p) for p in v.split("."))
+        released = re.findall(r"^## \[(?!Unreleased)([^\]]+)\]", CHANGELOG, re.M)
+        assert released == sorted(released, key=key, reverse=True)
+
+    def test_runtime_strings_interpolate_version(self):
+        """The banner, status footer, UA and startup log must use
+        __version__ rather than a baked-in literal."""
+        for anchor in ("SNJMeshWeatherBot/{__version__}",
+                       "Weather Bot v{__version__}",
+                       'f"v{__version__} | Started'):
+            assert anchor in SRC, anchor
 
 
 def _exec_block(start_marker: str, end_marker: str, ns: dict | None = None) -> dict:
@@ -326,6 +358,55 @@ class TestValidateConfig:
 
     def test_radar_station_defaults_when_absent(self):
         assert _validate_config(cfg()) == []
+
+    # --- command sync scope ---
+    @pytest.mark.parametrize("good", ["auto", "global", "guild", "GUILD"])
+    def test_valid_command_sync_accepted(self, good):
+        assert _validate_config(cfg(command_sync=good)) == []
+
+    @pytest.mark.parametrize("bad", ["both", "all", "", "instant"])
+    def test_bad_command_sync_is_error(self, bad):
+        errs = _validate_config(cfg(command_sync=bad))
+        assert any("command_sync" in e for e in errs)
+
+
+class TestSyncScopeResolution:
+    """Syncing the same commands to BOTH scopes makes every command appear
+    twice in Discord's picker — the v2.7.5 duplicate-commands bug.  Exactly
+    one scope must win."""
+
+    @staticmethod
+    def resolve(mode, guild_id):
+        """Mirror of the scope choice in _sync_commands()."""
+        if mode == "auto":
+            return "guild" if guild_id else "global"
+        return mode
+
+    def test_auto_with_guild_id_uses_guild_only(self):
+        assert self.resolve("auto", "123") == "guild"
+
+    def test_auto_without_guild_id_uses_global_only(self):
+        assert self.resolve("auto", None) == "global"
+
+    def test_explicit_global_overrides_guild_id(self):
+        """Forcing global keeps commands working in DMs."""
+        assert self.resolve("global", "123") == "global"
+
+    def test_explicit_guild_honoured(self):
+        assert self.resolve("guild", "123") == "guild"
+
+    def test_never_returns_both(self):
+        for mode in ("auto", "global", "guild"):
+            for gid in (None, "123"):
+                assert self.resolve(mode, gid) in ("global", "guild")
+
+    def test_source_syncs_exactly_one_scope(self):
+        """Guard against a future edit reintroducing the dual sync."""
+        block = SRC[SRC.index("async def _sync_commands"):
+                    SRC.index("@bot.event", SRC.index("async def _sync_commands"))]
+        # each branch must clear the opposite scope before/after syncing
+        assert "tree.clear_commands(guild=None)" in block
+        assert "tree.clear_commands(guild=guild)" in block
 
 
 # ============================================================================
