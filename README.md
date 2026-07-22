@@ -90,7 +90,34 @@ Two things to get right:
 - Optional: an EPA AirNow API key for `/aqi` — free at [docs.airnowapi.org](https://docs.airnowapi.org/)
 - Optional: `astral` for sunrise/sunset times
 
-No privileged Gateway Intents are needed — the bot runs on `discord.Intents.default()`. In the server it's invited to, it needs View Channel, Send Messages, Embed Links, Read Message History, and (if you want the conditions message pinned) Manage Messages.
+No privileged Gateway Intents are needed — the bot runs on `discord.Intents.default()`. See [Creating the Discord bot](#creating-the-discord-bot) for the exact scopes and permissions.
+
+## Creating the Discord bot
+
+1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and click **New Application**. Name it whatever you like — this name is what shows up in the command picker.
+2. Open the **Bot** tab and click **Reset Token** to reveal a token. Copy it into `discord_bot_token` in your config. Treat it like a password; anyone with it controls the bot. If you ever leak it, reset it here and the old one stops working.
+3. No **Privileged Gateway Intents** are needed. The bot runs on default intents — leave Presence, Server Members, and Message Content off.
+4. Open **OAuth2 → URL Generator** and tick:
+
+   **Scopes**
+   - `bot`
+   - `applications.commands` — required for slash commands; without it none of the `/` commands appear
+
+   **Bot Permissions**
+   - View Channels
+   - Send Messages
+   - Embed Links — all output is embeds, so nothing renders without this
+   - Attach Files — for the live radar image in `/radar`
+   - Read Message History — needed to find and edit the pinned conditions message after a restart
+   - Manage Messages — only for pinning the conditions message; skip it if you set `pin_conditions_message: false`
+   - Use External Emoji *(optional)* — only if your server has custom emoji you want in alerts
+
+5. Copy the generated URL at the bottom, open it, and pick the server to add the bot to. You need Manage Server permission on that server.
+6. Make sure the bot can actually see the target channel. Channel-level overrides beat server-level permissions, so a private channel needs the bot (or a role it has) added explicitly.
+
+To get `discord_channel_id` and `discord_guild_id`: enable **Settings → Advanced → Developer Mode** in Discord, then right-click the channel or server and choose **Copy ID**.
+
+**Running alongside an existing bot?** Create a separate application for this one rather than reusing an existing bot's token. Two processes sharing a token fight over the same slash-command interactions, and this bot's startup sync would overwrite the other bot's registered commands.
 
 ## Setup
 
@@ -118,6 +145,7 @@ Startup validates `config.json` and exits with a specific, readable error for an
 | `discord_bot_token` | — | **Required.** From the Discord Developer Portal |
 | `discord_channel_id` | — | Channel the bot posts conditions and alerts to |
 | `discord_guild_id` | none | Optional — enables near-instant slash-command sync for one server instead of the ~1 hour global sync |
+| `command_sync` | "auto" | `auto` / `global` / `guild` — which scope slash commands register in. `auto` uses guild scope when `discord_guild_id` is set, global otherwise |
 | `location_name` | "Southern NJ" | Display name used in embeds and slash-command descriptions (keep under 40 chars) |
 | `coverage` | 7 Southern NJ counties | Counties and NWS zones to match alerts against — see [Coverage area](#coverage-area) |
 | `conditions_update_mins` | 30 | How often the conditions message refreshes |
@@ -151,6 +179,8 @@ ruff check weather_bot.py tests/
 pytest
 ```
 
+When bumping the version, update `__version__` in `weather_bot.py` and add a matching entry at the top of `CHANGELOG.md` — a test asserts the two agree.
+
 The tests in `tests/` are regression tests for logic that has actually failed in the past — the Southern-NJ geography filter, the zone→county fallback table, update-chain reference resolution, and state pruning. If you touch any of that, run them.
 
 ## Data sources
@@ -162,6 +192,10 @@ The tests in `tests/` are regression tests for logic that has actually failed in
 - Tropical systems: [National Hurricane Center](https://www.nhc.noaa.gov/)
 
 Independent project — not affiliated with or endorsed by NOAA, NWS, EPA, or NHC.
+
+## Changelog
+
+Release history is in [CHANGELOG.md](CHANGELOG.md), following [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
 ## License
 
